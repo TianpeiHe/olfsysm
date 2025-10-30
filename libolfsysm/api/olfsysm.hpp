@@ -139,11 +139,15 @@ struct ModelParams {
             double sd;
         } noise;
 
+        double apl_taum;
+        double tau_apl2pn;
+
         /* bouton related*/
         int Btn_num_per_glom; 
+        bool pn_apl_tune;
         bool preset_Btn;
-        bool preset_wAPLBtn;
-        bool preset_wBtnAPL;
+        bool preset_wAPLPN;
+        bool preset_wPNAPL;
 
     } pn;
 
@@ -189,6 +193,12 @@ struct ModelParams {
         bool preset_wAPLKC;
         /* Set to true if using a pre-loaded KC->APL weight vector. */
         bool preset_wKCAPL;
+
+        /* in the case that we use preset_wAPLKC, whether we 0 the weights for threshold
+        determination*/
+        bool zero_wAPLKC;
+
+        bool pn_claw_to_APL;
 
         /* Ignore the FFAPL during KC simulation, even if run_FFAPL_sims has
          * been called. */
@@ -252,6 +262,7 @@ struct ModelParams {
 
         /* Time constants. */
         double taum;
+        double apl_Cm;
         double apl_taum;
         double tau_apl2kc;
 
@@ -353,6 +364,12 @@ struct RunVars {
 
     /* PN-related variables. */
     struct PN {
+        /* APL to bouton weights*/
+        Column wAPLPN; 
+
+        /* bouton to APL weights*/
+        Row wPNAPL;
+
         std::vector<Matrix> sims;
 
         std::vector<int> Btn_to_pn;
@@ -453,12 +470,6 @@ struct RunVars {
         /* nboutons x nclaws*/ // wBKC x wPNB = wPNKC
         Matrix wBKC; 
 
-        /* APL to bouton weights*/
-        Column wAPLBtn; 
-
-        /* bouton to APL weights*/
-        Row wBtnAPL;
-
     } kc;
 
     /* Logger for this run. */
@@ -494,7 +505,7 @@ void sim_LN_layer(
 
 /* Model PN response to one odor. */
 void sim_PN_layer(
-        ModelParams const& p, RunVars const& rv,
+        ModelParams const& p, RunVars& rv,
         Matrix const& orn_t, Row const& inhA, Row const& inhB,
         Matrix& pn_t);
 
