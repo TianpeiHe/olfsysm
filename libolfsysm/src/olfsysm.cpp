@@ -103,11 +103,14 @@ ModelParams const DEFAULT_PARAMS = []() {
     p.pn.inhadd     = 31.4088;
     p.pn.noise.mean = 0.0;
     p.pn.noise.sd   = 0.0;
+    p.pn.apl_taum   = 0.05;
+    p.pn.tau_apl2pn = 0.01;
     /* bouton related model param initialization*/
     p.pn.Btn_num_per_glom = 10;
-    p.pn.preset_Btn       = false;       
-    p.pn.preset_wAPLBtn   = false; 
-    p.pn.preset_wBtnAPL   = false;
+    p.pn.pn_apl_tune     = false;
+    p.pn.preset_Btn      = false;       
+    p.pn.preset_wAPLPN   = false; 
+    p.pn.preset_wPNAPL   = false;
 
     p.kc.N                     = 2000;
     p.kc.nclaws                = 6;
@@ -118,6 +121,8 @@ ModelParams const DEFAULT_PARAMS = []() {
     p.kc.tune_apl_weights      = true;
     p.kc.preset_wAPLKC         = false;
     p.kc.preset_wKCAPL         = false;
+    p.kc.zero_wAPLKC           = false; 
+    p.kc.pn_claw_to_APL        = false; 
     p.kc.ignore_ffapl          = false;
     p.kc.fixed_thr             = 0;
     p.kc.add_fixed_thr_to_spont= false;
@@ -136,6 +141,7 @@ ModelParams const DEFAULT_PARAMS = []() {
     // TODO doc how each of these are diff (w/ units if i can). not currently mentioned
     // in .hpp file
     p.kc.taum                  = 0.01;
+    p.kc.apl_Cm                = 0.1; 
     p.kc.apl_taum              = 0.05;
     p.kc.tau_apl2kc            = 0.01;
 
@@ -275,6 +281,10 @@ RunVars::LN::LN(ModelParams const& p) :
     inhB{std::vector<Vector>(get_nodors(p), Row(1, p.time.steps_all()))} {
 }
 RunVars::PN::PN(ModelParams const& p) :
+    wAPLPN( p.pn.preset_Btn ? get_ngloms(p) * p.pn.Btn_num_per_glom
+        : get_ngloms(p), 1 ),
+    wPNAPL( 1, p.pn.preset_Btn ? get_ngloms(p) * p.pn.Btn_num_per_glom
+        : get_ngloms(p) ),
     sims(get_nodors(p), Matrix(p.pn.preset_Btn ? get_ngloms(p) * p.pn.Btn_num_per_glom
         : get_ngloms(p), p.time.steps_all())) {
 }
@@ -319,10 +329,8 @@ RunVars::KC::KC(ModelParams const& p) :
     // Is_sims(p.kc.save_Is_sims ? get_nodors(p) : 0,
     //         Matrix( (p.kc.apl_coup_const != -1) ? int(p.kc.comp_num) : 1,
     //                 p.time.steps_all() )),
-    tuning_iters(0),
+    tuning_iters(0)
     // I guess this should be the defalt case? 
-    wAPLBtn( get_ngloms(p) * p.pn.Btn_num_per_glom, 1 ),
-    wBtnAPL( 1, get_ngloms(p) * p.pn.Btn_num_per_glom )
 {
     if (p.kc.wPNKC_one_row_per_claw) {
         const auto& raw = p.kc.kc_ids;  // One body ID per claw
@@ -528,7 +536,6 @@ void build_wPNKC_from_cxnd(
 }
 void build_wPNKC(ModelParams const& p, RunVars& rv) {
     if (p.kc.preset_wPNKC) {
-        rv.log("preset_wPNKC");
         return;
     }
     if (p.kc.seed != 0) {
@@ -633,8 +640,6 @@ Column choose_KC_thresh_mixed(
     Column hstatic = choose_KC_thresh_homeostatic(p, KCpks2, spont_in);
     return (uniform+hstatic)/2.0;
 }
-
- 
 void fit_sparseness(ModelParams const& p, RunVars& rv) {
     rv.log("fitting sparseness");
 
@@ -645,6 +650,8 @@ void fit_sparseness(ModelParams const& p, RunVars& rv) {
 
     // fix? I don't need to re-size this right? it should be sized up correctly already? 
     // only in the situation when there's no preset_wAPLKC? 
+    Column temp_wAPLKC;
+    Row temp_wKCAPL;
     unsigned num_claws = rv.kc.claw_to_kc.size();
     if(!p.kc.preset_wAPLKC){
         if(!p.kc.wPNKC_one_row_per_claw){
@@ -666,6 +673,8 @@ void fit_sparseness(ModelParams const& p, RunVars& rv) {
             rv.log(cat("rv.kc.wKCAPL.cols():", rv.kc.wKCAPL.cols()));
         }
     } else {
+        temp_wAPLKC = rv.kc.wAPLKC; 
+        temp_wKCAPL = rv.kc.wKCAPL; 
         rv.log("p.kc.preset_wAPLKC is true");
     }
     int wAPLKC_nan_count = 0;
@@ -791,8 +800,22 @@ void fit_sparseness(ModelParams const& p, RunVars& rv) {
     // (and put inside this conditional to avoid overwriting values set in python, via
     // pybind11)
     if (p.kc.tune_apl_weights) {
-        if (!p.kc.preset_wAPLKC) {
+        // We prob want to set zero for either cases so that the threshold can be set properly 
+        if (!p.kc.preset_wAPLKC){
             rv.kc.wAPLKC.setZero();
+        } else if (p.kc.zero_wAPLKC) {
+            rv.kc.wAPLKC.setZero();
+            if (p.kc.wPNKC_one_row_per_claw) {
+                double preset_wKCAPL_base = 1.0/float(p.kc.N);
+                for (Eigen::Index i_c = 0; i_c < rv.kc.claw_to_kc.size(); ++i_c) {
+                    unsigned kc = rv.kc.claw_to_kc[i_c];
+                    const std::size_t cnt = rv.kc.kc_to_claws[kc].size(); // claws of this KC
+                    const double val = preset_wKCAPL_base / static_cast<double>(cnt ? cnt : 1);
+                    rv.kc.wKCAPL(0, i_c) = val;  // row vector
+                }
+            } else {
+                rv.kc.wKCAPL.setConstant(1.0/float(p.kc.N));
+            }
         }
         if (!p.kc.preset_wKCAPL) {
             if (p.kc.wPNKC_one_row_per_claw) {
@@ -871,6 +894,9 @@ void fit_sparseness(ModelParams const& p, RunVars& rv) {
      * Initially set to the below value because, given default model
      * parameters, it causes tuning to complete in just one iteration. */
     double sp = 0.0789;
+    if(p.kc.wPNKC_one_row_per_claw && p.kc.zero_wAPLKC){
+        sp = 0.0789;
+    }
 
     /* Used to count number of times looped; the 'learning rate' is decreased
      * as 1/sqrt(count) with each iteration. */
@@ -921,6 +947,7 @@ void fit_sparseness(ModelParams const& p, RunVars& rv) {
                 // use the existing string p.kc.thr_type [but that could be changed?])
                 rv.log(cat("choosing thresholds from spontaneous input (thrtype=",
                            thrtype, ")"));
+                rv.log(cat("wAPLKC right before thres: ", rv.kc.wAPLKC.mean()));
             }
 
             // TODO TODO maybe i still want to sim_KC_layer in use_vector_thr case
@@ -1014,6 +1041,15 @@ void fit_sparseness(ModelParams const& p, RunVars& rv) {
             // [this is what al_analysis is currently doing], so we can set *_scale
             // factors to same as wAPLKC/wKCAPL being set below)?
             /* Starting values for to-be-tuned APL<->KC weights. */
+
+            // Reset the variable wAPLKC 
+            if (p.kc.preset_wAPLKC && p.kc.zero_wAPLKC){
+                rv.kc.wAPLKC = temp_wAPLKC;
+                rv.kc.wKCAPL = temp_wKCAPL;
+                rv.log(cat("after thres initialization wAPLKC: ", rv.kc.wAPLKC.mean()));
+            }
+            
+
             if (!p.kc.preset_wAPLKC) {
                 // e.g. 3 w/ sp_target=0.1
                 if(p.kc.wPNKC_one_row_per_claw){
@@ -1223,7 +1259,9 @@ void fit_sparseness(ModelParams const& p, RunVars& rv) {
                 // other KCs, so don't think i can as easily use to set e.g. a single
                 // KC's APL weights.
                 //rv.kc.pks = KCpks;
-
+                // const int K = 2;  // tune: 2 or 3
+                // KCmean_st = (KCmean_st.array() >= double(K)).cast<double>().matrix();
+                // sp = KCmean_st.mean();
                 KCmean_st = (KCmean_st.array() > 0.0).select(1.0, KCmean_st);
                 sp = KCmean_st.mean();
             }
@@ -1256,6 +1294,8 @@ void fit_sparseness(ModelParams const& p, RunVars& rv) {
     // preset, or wAPLKC_scale/wKCAPL_scale when preset)
     rv.log("done fitting sparseness");
 }
+
+
 
 void sim_ORN_layer(
         ModelParams const& p, RunVars const& rv,
@@ -1304,92 +1344,256 @@ void sim_LN_layer(
         response(t) = (potential(t)-p.ln.thr)*double(potential(t)>p.ln.thr);
     }
 }
+// void sim_PN_layer(
+//         ModelParams const& p, RunVars& rv,
+//         Matrix const& orn_t, Row const& inhA, Row const& inhB,
+//         Matrix& pn_t) {
+//     // TODO verify this isn't actually making noise (both params 0? or sd at least?)?
+//     // it should be seed-able if it is
+//     std::normal_distribution<double> noise(p.pn.noise.mean, p.pn.noise.sd);
+//     pn_t.setZero();
+//     const int ng = get_ngloms(p);
+//     Column spont   = p.orn.data.spont*p.pn.inhsc/(p.orn.data.spont.sum()+p.pn.inhadd);
+//     Column spont_btn;
+
+//     // Initializing PN<->APL interaction vector
+//     Matrix inh = Matrix(1, p.time.steps_all());
+//     inh.setZero();
+//     Matrix Is = Matrix(1, p.time.steps_all());  
+//     Is.setZero();
+
+//     int total_btns = 0;
+//     if(p.pn.preset_Btn){
+//         total_btns= rv.pn.Btn_to_pn.size();
+//     }
+//     int total_pns = ng;
+//     if(p.pn.preset_wAPLPN && p.pn.preset_wPNAPL){
+//         if(p.pn.preset_Btn){
+//             assert(rv.pn.wAPLPN.size() == total_btns);
+//             assert(rv.pn.wPNAPL.size() == total_btns);
+//         } else {
+//             assert(rv.pn.wAPLPN.size() == total_pns);
+//             assert(rv.pn.wPNAPL.size() == total_pns); 
+//         }
+//     } else {
+//         if(p.pn.preset_Btn){
+//             rv.pn.wAPLPN.resize(total_btns, 1);
+//             rv.pn.wPNAPL.resize(1, total_btns); 
+//         } else {
+//             rv.pn.wAPLPN.resize(total_pns, 1);
+//             rv.pn.wPNAPL.resize(1, total_pns); 
+//         }
+//         rv.pn.wAPLPN.setZero();
+//         rv.pn.wPNAPL.setZero(); 
+//     }
+//     // MOVED DECLARATIONS UP so they can be resized in the if/else block below.
+//     Column orn_delta_btn;
+//     Column dPNdt;
+        
+//     if(p.pn.preset_Btn){
+//         // total bouton count
+//         pn_t.resize(total_btns, p.time.steps_all());
+//         spont_btn.resize(total_btns, 1);
+        
+//         // ADDED: Resize loop variables now that we know their dimension.
+//         orn_delta_btn.resize(total_btns, 1);
+//         dPNdt.resize(total_btns, 1);
+
+//         // fill each bouton row with its per-bouton baseline across time
+//         for (int g = 0; g < ng; ++g) {
+//             const auto& btns = rv.pn.pn_to_Btns[g];      // std::vector<int> of bouton indices for glom g
+//             const int Bg = (int)btns.size();
+//             // STEP 1: Calculate initialization value from RAW data. 
+//             // const double per_btn_init = (Bg > 0) ? p.orn.data.spont(g) / double(Bg) : 0.0;
+//             const double per_btn_init = (Bg > 0) ? p.orn.data.spont(g): 0.0;
+//             // STEP 2: Calculate simulation baseline from the SCALED 'spont' variable. 
+//             // const double per_btn_baseline = (Bg > 0) ? spont(g) / double(Bg) : 0.0;
+//             const double per_btn_baseline = (Bg > 0) ? spont(g) : 0.0;
+
+//             for (int k = 0; k < Bg; ++k) {
+//                 const int b = btns[k];                  // bouton row index in pn_t
+//                 spont_btn(b) = per_btn_baseline;
+//                 // Fill the full row (1×T): scalar * time row
+//                 pn_t.row(b) = per_btn_init * p.time.row_all();
+//             }
+//         }
+//     } else {
+//         pn_t = p.orn.data.spont*p.time.row_all();
+        
+//         // ADDED: Resize dPNdt for the non-bouton case.
+//         // orn_delta_btn is not used in this case, so it can remain size 0.
+//         dPNdt.resize(ng, 1);
+//     }
+//     double inh_PN = 0.0;
+//     Column orn_delta;
+//     //rv.log("we are about to enter the loop");
+//     for (unsigned t = 1; t < p.time.steps_all(); t++) {
+//         Column orn_delta_glom = orn_t.col(t - 1) - p.orn.data.spont; // ng×1
+//         Eigen::VectorXd pn_activity = pn_t.col(t-1);
+//         if (p.pn.preset_Btn) {
+//             // expand glomerulus delta → bouton delta with same sharing
+//             for (int g = 0; g < ng; ++g) {
+//                 const auto& btns = rv.pn.pn_to_Btns[g];
+//                 const int Bg = static_cast<int>(btns.size());
+//                 // const double per_btn_delta = (Bg > 0) ? orn_delta_glom(g) / double(Bg) : 0.0; 
+//                 const double per_btn_delta = orn_delta_glom(g);
+//                 for (int k = 0; k < Bg; ++k) {
+//                     // This line is now safe because orn_delta_btn has been resized.
+//                     orn_delta_btn(btns[k]) = per_btn_delta;
+//                 }
+//             }
+//             Column pn_act_btn = (pn_t.col(t-1) - spont_btn).cwiseMax(0.0);
+//             double pn_apl_drive = (rv.pn.wPNAPL * pn_act_btn).value();
+//             double dIsdt = -Is(t-1) + pn_apl_drive; 
+//             double dinhdt = -inh(t-1) + Is(t-1); 
+//             const double inh_scalar = inh(t-1);
+//             dPNdt = -pn_t.col(t - 1) + spont_btn + rv.pn.wAPLPN*inh_scalar;
+//             dPNdt += 200.0 * ((orn_delta_btn.array() + p.pn.offset) * p.pn.tanhsc / 200.0 * inh_PN)
+//                                  .matrix().unaryExpr<double(*)(double)>(&tanh);
+//             Is(t) = Is(t-1) + dIsdt * p.time.dt/p.pn.apl_taum;
+//             inh(t) = inh(t-1) + dinhdt * p.time.dt/p.pn.tau_apl2pn;
+//         } else {
+//             //rv.log("we are at the right position?");
+//             Column pn_act_glom = (pn_t.col(t-1) - spont).cwiseMax(0.0);
+//             double pn_apl_drive = (rv.pn.wPNAPL * pn_act_glom).value();
+//             double dIsdt = -Is(t-1) + pn_apl_drive; 
+//             double dinhdt = -inh(t-1) + Is(t-1); 
+//             const double inh_scalar = inh(t-1);
+//             //rv.log(cat("everything fine before inh_scaler"));
+//             dPNdt = -pn_t.col(t - 1) + spont + rv.pn.wAPLPN*inh_scalar;
+//             dPNdt += 200.0 * ((orn_delta_glom.array() + p.pn.offset) * p.pn.tanhsc / 200.0 * inh_PN)
+//                                  .matrix().unaryExpr<double(*)(double)>(&tanh);
+
+//             //rv.log("everything fine after dPNdt");
+//             Is(t) = Is(t-1) + dIsdt * p.time.dt/p.pn.apl_taum;
+//             inh(t) = inh(t-1) + dinhdt * p.time.dt/p.pn.tau_apl2pn;
+//         }
+//         inh_PN = p.pn.inhsc/(p.pn.inhadd+0.25*inhA(t)+0.75*inhB(t));
+//         pn_t.col(t) = pn_t.col(t-1) + dPNdt*p.time.dt/p.pn.taum;
+
+//         // TODO TODO why not do something like this in sim_ORN_layer case too?
+//         // ann also handle the 2 cases the same way?
+//         pn_t.col(t) = (0.0 < pn_t.col(t).array()).select(pn_t.col(t), 0.0);
+//     }
+// }
 void sim_PN_layer(
-        ModelParams const& p, RunVars const& rv,
-        Matrix const& orn_t, Row const& inhA, Row const& inhB,
-        Matrix& pn_t) {
-    // TODO verify this isn't actually making noise (both params 0? or sd at least?)?
-    // it should be seed-able if it is
+    ModelParams const& p, RunVars& rv,
+    Matrix const& orn_t, Row const& inhA, Row const& inhB,
+    Matrix& pn_t)
+{
+    // TODO: Verify this isn't actually making noise (both params 0? or sd at least?)?
+    // It should be seed-able if it is.
     std::normal_distribution<double> noise(p.pn.noise.mean, p.pn.noise.sd);
 
     const int ng = get_ngloms(p);
-    Column spont   = p.orn.data.spont*p.pn.inhsc/(p.orn.data.spont.sum()+p.pn.inhadd);
-    Column spont_btn;
+    pn_t.setZero();
+    // Baseline spontaneous activity, scaled for inhibition
+    Column spont = p.orn.data.spont * p.pn.inhsc / (p.orn.data.spont.sum() + p.pn.inhadd);
     
-    // MOVED DECLARATIONS UP so they can be resized in the if/else block below.
-    Column orn_delta_btn;
-    Column dPNdt;
-        
-    if(p.pn.preset_Btn){
-        // total bouton count
-        int total_btns = rv.pn.Btn_to_pn.size();
-        pn_t.resize(total_btns, p.time.steps_all());
-        spont_btn.resize(total_btns, 1);
-        
-        // ADDED: Resize loop variables now that we know their dimension.
-        orn_delta_btn.resize(total_btns, 1);
-        dPNdt.resize(total_btns, 1);
+    // Time-series vectors for PN<->APL interaction
+    Matrix inh = Matrix::Zero(1, p.time.steps_all());
+    Matrix Is = Matrix::Zero(1, p.time.steps_all());
 
-        // fill each bouton row with its per-bouton baseline across time
+    const int num_pns = p.pn.preset_Btn ? rv.pn.Btn_to_pn.size() : ng;
+
+    if (!p.pn.preset_wAPLPN || !p.pn.preset_wPNAPL) {
+       
+        rv.pn.wAPLPN.setZero();
+        rv.pn.wPNAPL.setZero();
+    }
+    // Ensure dimensions match if they are preset
+    assert(rv.pn.wAPLPN.rows() == num_pns);
+    assert(rv.pn.wPNAPL.cols() == num_pns);
+
+    Column spont_btn;       // Spontaneous activity per bouton
+    Column orn_delta_btn;   // ORN delta activity per bouton
+
+    if (p.pn.preset_Btn) {
+        // Resize matrices for the total number of boutons
+        assert(pn_t.rows() == num_pns);
+        //pn_t.resize(num_pns, p.time.steps_all());
+        spont_btn.resize(num_pns, 1);
+        orn_delta_btn.resize(num_pns, 1); // Resized here for use in the loop
+
+        // Initialize each bouton's state based on its parent glomerulus
         for (int g = 0; g < ng; ++g) {
-            const auto& btns = rv.pn.pn_to_Btns[g];      // std::vector<int> of bouton indices for glom g
+            const auto& btns = rv.pn.pn_to_Btns[g]; // Vector of bouton indices for glom g
             const int Bg = (int)btns.size();
-            // STEP 1: Calculate initialization value from RAW data. 
-            // const double per_btn_init = (Bg > 0) ? p.orn.data.spont(g) / double(Bg) : 0.0;
-            const double per_btn_init = (Bg > 0) ? p.orn.data.spont(g): 0.0;
-            // STEP 2: Calculate simulation baseline from the SCALED 'spont' variable. 
-            // const double per_btn_baseline = (Bg > 0) ? spont(g) / double(Bg) : 0.0;
-            const double per_btn_baseline = (Bg > 0) ? spont(g) : 0.0;
+            if (Bg > 0) {
+                // Initial state from raw ORN spontaneous data
+                const double per_btn_init = p.orn.data.spont(g);
+                // Simulation baseline from scaled 'spont' variable
+                const double per_btn_baseline = spont(g);
 
-            for (int k = 0; k < Bg; ++k) {
-                const int b = btns[k];                  // bouton row index in pn_t
-                spont_btn(b) = per_btn_baseline;
-                // Fill the full row (1×T): scalar * time row
-                pn_t.row(b) = per_btn_init * p.time.row_all();
+                for (int bouton_idx : btns) {
+                    spont_btn(bouton_idx) = per_btn_baseline;
+                    pn_t.row(bouton_idx) = per_btn_init * p.time.row_all();
+                }
             }
         }
     } else {
-        pn_t = p.orn.data.spont*p.time.row_all();
-        
-        // ADDED: Resize dPNdt for the non-bouton case.
-        // orn_delta_btn is not used in this case, so it can remain size 0.
-        dPNdt.resize(ng, 1);
+        pn_t = p.orn.data.spont * p.time.row_all();
     }
     double inh_PN = 0.0;
-    Column orn_delta;
-    // Column orn_delta_btn; // Declarations were moved up
-    // Column dPNdt;         // Declarations were moved up
-    
+
     for (unsigned t = 1; t < p.time.steps_all(); t++) {
-        Column orn_delta_glom = orn_t.col(t - 1) - p.orn.data.spont; // ng×1
+        // --- 4a. Select correct inputs (bouton or glomerulus) ---
+        
+        const Column* spont_ref; // Pointer to use either spont or spont_btn
+        Column orn_delta;        // Will hold either per-glom or per-bouton delta
+
+        Column orn_delta_glom = orn_t.col(t - 1) - p.orn.data.spont; // ng x 1
 
         if (p.pn.preset_Btn) {
-            // expand glomerulus delta → bouton delta with same sharing
+            spont_ref = &spont_btn;
+            // Expand glomerulus delta to bouton delta
             for (int g = 0; g < ng; ++g) {
                 const auto& btns = rv.pn.pn_to_Btns[g];
-                const int Bg = static_cast<int>(btns.size());
-                // const double per_btn_delta = (Bg > 0) ? orn_delta_glom(g) / double(Bg) : 0.0; 
+                // Note: Original logic did not divide by number of boutons, so we preserve that.
                 const double per_btn_delta = orn_delta_glom(g);
-                for (int k = 0; k < Bg; ++k) {
-                    // This line is now safe because orn_delta_btn has been resized.
-                    orn_delta_btn(btns[k]) = per_btn_delta;
+                for (int bouton_idx : btns) {
+                    orn_delta_btn(bouton_idx) = per_btn_delta;
                 }
             }
-
-            dPNdt = -pn_t.col(t - 1) + spont_btn;
-            dPNdt += 200.0 * ((orn_delta_btn.array() + p.pn.offset) * p.pn.tanhsc / 200.0 * inh_PN)
-                                 .matrix().unaryExpr<double(*)(double)>(&tanh);
+            orn_delta = orn_delta_btn;
         } else {
-            dPNdt = -pn_t.col(t - 1) + spont;
-            dPNdt += 200.0 * ((orn_delta_glom.array() + p.pn.offset) * p.pn.tanhsc / 200.0 * inh_PN)
-                                 .matrix().unaryExpr<double(*)(double)>(&tanh);
+            spont_ref = &spont;
+            orn_delta = orn_delta_glom;
         }
-        inh_PN = p.pn.inhsc/(p.pn.inhadd+0.25*inhA(t)+0.75*inhB(t));
-        pn_t.col(t) = pn_t.col(t-1) + dPNdt*p.time.dt/p.pn.taum;
+        
+        // PN activity above baseline (rectified)
+        Column pn_act = (pn_t.col(t - 1) - *spont_ref).cwiseMax(0.0);
+        // 
+        
+        // Drive from PNs to the inhibitory APL neuron
+        double pn_apl_drive = (rv.pn.wPNAPL * pn_act).value();
+        
+        // Update inhibition dynamics
+        double dIsdt = -Is(t - 1) + pn_apl_drive;
+        double dinhdt = -inh(t - 1) + Is(t - 1);
+        Is(t) = Is(t - 1) + dIsdt * p.time.dt / p.pn.apl_taum;
+        inh(t) = inh(t - 1) + dinhdt * p.time.dt / p.pn.tau_apl2pn;
+        
+        // Calculate change in PN firing rate (dPN/dt)
+        const double inh_scalar = inh(t - 1);
+        Column dPNdt;
 
-        // TODO TODO why not do something like this in sim_ORN_layer case too?
-        // ann also handle the 2 cases the same way?
-        pn_t.col(t) = (0.0 < pn_t.col(t).array()).select(pn_t.col(t), 0.0);
+        if (p.pn.pn_apl_tune) {
+            dPNdt = -pn_t.col(t - 1) + *spont_ref + rv.pn.wAPLPN * inh_scalar;
+        } else {
+            dPNdt = -pn_t.col(t - 1) + *spont_ref; // APL effect removed 
+        }        
+        // rv.log(cat("dPNdt.rows", dPNdt.rows()));
+        // rv.log(cat("dPNdt.cols", dPNdt.cols()));
+        // rv.log(cat("pn_t.rows", pn_t.rows()));
+        // rv.log(cat("pn_t.rows", pn_t.cols()));
+        // Add theORN input term, shaped by a tanh function
+        dPNdt += 200.0 * ((orn_delta.array() + p.pn.offset) * p.pn.tanhsc / 200.0 * inh_PN)
+                           .matrix().unaryExpr<double(*)(double)>(&tanh);
+        
+        inh_PN = p.pn.inhsc / (p.pn.inhadd + 0.25 * inhA(t) + 0.75 * inhB(t));
+        pn_t.col(t) = pn_t.col(t - 1) + dPNdt * p.time.dt / p.pn.taum;
+        pn_t.col(t) = (pn_t.col(t).array() < 0.0).select(0.0, pn_t.col(t));
     }
 }
 void sim_FFAPL_layer(
@@ -1439,104 +1643,134 @@ void sim_KC_layer(
     float use_ffapl = float(!p.kc.ignore_ffapl); 
     if (p.kc.wPNKC_one_row_per_claw) {
         if(p.kc.apl_coup_const != -1){
-            // --- setup (unchanged pieces omitted) ---
             // --- Setup ---
             const auto& claws_by_compartment = rv.kc.compartment_to_claws;
             const int num_comp = int(claws_by_compartment.size());
-            double g_diff = p.kc.apl_coup_const;  // diffusion coeff; can be 0.0
+            double g_voltage_coup = p.kc.apl_coup_const;
 
-            Eigen::VectorXd inh_prev_per_comp  = Eigen::VectorXd::Zero(num_comp);
+            // --- State Variables ---
             Eigen::VectorXd Is_prev_per_comp   = Eigen::VectorXd::Zero(num_comp);
-            Eigen::VectorXd inh_curr_per_comp  = inh_prev_per_comp;
             Eigen::VectorXd Is_curr_per_comp   = Is_prev_per_comp;
+            
+            // APL has its own membrane potential, which replaces 'inh' for feedback
+            Eigen::VectorXd Vm_apl_prev_per_comp = Eigen::VectorXd::Zero(num_comp);
+            Eigen::VectorXd Vm_apl_curr_per_comp = Vm_apl_prev_per_comp;
+
+            // 'inh' is preserved for other uses but not for feedback in this loop
+            Eigen::VectorXd inh_prev_per_comp  = Eigen::VectorXd::Zero(num_comp);
+            Eigen::VectorXd inh_curr_per_comp  = inh_prev_per_comp;
 
             // Scalars evolve in lock-step as sums of vectors
             double inh_prev = inh_prev_per_comp.sum();
             double Is_prev  = Is_prev_per_comp.sum();
             double inh_curr = inh_prev;
             double Is_curr  = Is_prev;
-
             inh(0,0) = inh_prev;   // log scalar aggregates (global)
             Is(0,0)  = Is_prev;
 
+            // (rest of setup is the same)
             Column dKCdt;
             Eigen::VectorXd comp_drive(num_comp);
             Eigen::VectorXd pn_drive(p.kc.N);
             Eigen::VectorXd kc_apl_inh(p.kc.N);
-
             const bool wkcapl_rowvec = (rv.kc.wKCAPL.rows() == 1);
             const bool waplkc_colvec = (rv.kc.wAPLKC.cols() == 1);
 
             for (unsigned t = p.time.start_step() + 1; t < p.time.steps_all(); ++t) {
-                // KC activity at t-1
+                // (1) KC -> APL drive per compartment (Unchanged)
                 const Eigen::VectorXd kc_activity =
                     (nves.col(t-1).array() * spikes.col(t-1).array()).matrix();
 
-                // (1) KC -> APL drive per compartment
+                Eigen::VectorXd claw_drive(rv.kc.wPNKC.rows());
+                claw_drive.noalias() = rv.kc.wPNKC * pn_t.col(t);
+
                 comp_drive.setZero();
-                for (int comp = 0; comp < num_comp; ++comp) {
-                    double s = 0.0;
-                    for (int claw : claws_by_compartment[(size_t)comp]) {
-                        const unsigned kc = rv.kc.claw_to_kc[(Eigen::Index)claw];
-                        const double w_kc_apl = wkcapl_rowvec ? rv.kc.wKCAPL(0, claw)
-                                                            : rv.kc.wKCAPL(claw, 0);
-                        s += w_kc_apl * kc_activity[kc];
+
+                if(!p.kc.pn_claw_to_APL){
+                    for (int comp = 0; comp < num_comp; ++comp) {
+                        double s = 0.0;
+                        for (int claw : claws_by_compartment[(size_t)comp]) {
+                            const unsigned kc = rv.kc.claw_to_kc[(Eigen::Index)claw];
+                            const double w_kc_apl = wkcapl_rowvec ? rv.kc.wKCAPL(0, claw) : rv.kc.wKCAPL(claw, 0);
+                            s += w_kc_apl * kc_activity[kc];
+                        }
+                        comp_drive[comp] = 1e4 * s;
                     }
-                    comp_drive[comp] = 1e4 * s;   // keep your scale if you like
+                } else {
+                    for (int comp = 0; comp < num_comp; ++comp) {
+                        double s = 0.0;
+                        for (int claw : claws_by_compartment[(size_t)comp]) {
+                            const double w_kc_apl = wkcapl_rowvec ? rv.kc.wKCAPL(0, claw) : rv.kc.wKCAPL(claw, 0);
+                            s += w_kc_apl * claw_drive[claw];
+                        }
+                        comp_drive[comp] = 0.2 * s;
+                    }
                 }
+                // (2) APL Internal Dynamics (REVISED)
+                // (2a) The synaptic current 'Is' is updated as before.
+                Eigen::VectorXd dIs_comp_dt = -Is_prev_per_comp + comp_drive; 
 
-                // (2) Vector RHS
-                Eigen::VectorXd dIs_comp_dt  = -Is_prev_per_comp  + comp_drive;
-                Eigen::VectorXd dInh_comp_dt = -inh_prev_per_comp + Is_prev_per_comp;
+                // (2b) Calculate APL voltage change using the simplified capacitive model.
+                Eigen::VectorXd dVm_apl_dt = Eigen::VectorXd::Zero(num_comp);
+                const double inv_Cm = 1.0 / p.kc.apl_Cm;       // The single new parameter
+                const double inv_taum = 1.0 / p.kc.apl_taum; // Existing parameter
 
-                // (2a) Diffusion on inh (Laplacian sums to 0 => scalar invariant)
                 for (int c = 0; c < num_comp; ++c) {
+                    // Synaptic current from KCs
+                    const double I_syn = Is_prev_per_comp[c];
+
+                    // Electrical coupling current from neighbors
                     const int L = (c - 1 + num_comp) % num_comp;
                     const int R = (c + 1) % num_comp;
-                    dInh_comp_dt[c] += g_diff * (inh_prev_per_comp[L] + inh_prev_per_comp[R]
-                                                - 2.0 * inh_prev_per_comp[c]);
-                    // dInh_comp_dt[c] += g_diff[c] * (inh_prev_per_comp[L]);
+                    const double I_coupling = g_voltage_coup * (Vm_apl_prev_per_comp[L] + Vm_apl_prev_per_comp[R]
+                                                            - 2.0 * Vm_apl_prev_per_comp[c]);
+                    
+                    // Sum the currents
+                    const double I_total = I_syn + I_coupling;
+
+                    // The change in voltage is the leak plus the integrated total current.
+                    // dV/dt = -V/tau + I_total/Cm
+                    dVm_apl_dt[c] = -inv_taum * Vm_apl_prev_per_comp[c] + inv_Cm * I_total;
                 }
-                
 
-                // (2b) Scalar RHS as sums (this guarantees lock-step equivalence)
-                double dIsdt  = dIs_comp_dt.sum();
-                double dinhdt = dInh_comp_dt.sum();
+                // (2c) 'inh' variable is updated as before for other uses.
+                Eigen::VectorXd dInh_comp_dt = -inh_prev_per_comp + Is_prev_per_comp;
 
-                // (3) PN -> claw -> KC; **global** APL feedback (the key line)
-                Eigen::VectorXd claw_drive(rv.kc.wPNKC.rows());
-                claw_drive.noalias() = rv.kc.wPNKC * pn_t.col(t);                
+                // double dIsdt  = dIs_comp_dt.sum();
+                // double dinhdt = dInh_comp_dt.sum();
+
+                // (3) APL -> KC Feedback (MODIFIED)
                 pn_drive.setZero();
                 kc_apl_inh.setZero();
 
-                // use the *vector* per-compartment inhibition (previous step)
                 for (int comp = 0; comp < num_comp; ++comp) {
-                    const double apl_comp_prev = inh_prev_per_comp[comp];
+                    // Feedback effect is now the APL's rectified voltage directly (gain = 1.0).
+                    const double total_apl_effect = std::max(0.0, Vm_apl_prev_per_comp[comp]);
 
                     for (int claw : claws_by_compartment[(size_t)comp]) {
                         const unsigned kc = rv.kc.claw_to_kc[(Eigen::Index)claw];
                         pn_drive[kc] += claw_drive[claw];
-
-                        const double w_apl_kc = waplkc_colvec ? rv.kc.wAPLKC(claw, 0)
-                                                            : rv.kc.wAPLKC(0, claw);
-                        // compartment-specific inhibition:
-                        kc_apl_inh[kc] += w_apl_kc * apl_comp_prev;
+                        const double w_apl_kc = waplkc_colvec ? rv.kc.wAPLKC(claw, 0) : rv.kc.wAPLKC(0, claw);
+                        kc_apl_inh[kc] += w_apl_kc * total_apl_effect;
                     }
                 }
 
-                // (4) KC membrane + spikes
+                // (4) KC membrane + spikes (Unchanged)
                 dKCdt = (-Vm.col(t-1) + pn_drive - kc_apl_inh).array()
-                        - float(!p.kc.ignore_ffapl) * ffapl_t(t-1);
+                    - use_ffapl * ffapl_t(t-1);
                 Vm.col(t) = Vm.col(t-1) + dKCdt * (p.time.dt / p.kc.taum);
 
-                // (5) Advance vectors and scalars in lock-step
-                Is_curr_per_comp  = Is_prev_per_comp  + (p.time.dt / p.kc.tau_apl2kc) * dIs_comp_dt;
-                inh_curr_per_comp = inh_prev_per_comp + (p.time.dt / p.kc.apl_taum)   * dInh_comp_dt;
+                // (5) Advance APL state variables (Unchanged from previous version)
+                Is_curr_per_comp   = Is_prev_per_comp   + (p.time.dt / p.kc.tau_apl2kc) * dIs_comp_dt;
+                inh_curr_per_comp  = inh_prev_per_comp  + (p.time.dt / p.kc.apl_taum)   * dInh_comp_dt;
+                Vm_apl_curr_per_comp = Vm_apl_prev_per_comp + p.time.dt * dVm_apl_dt;
+                
+                // Is_curr  = Is_prev  + (p.time.dt / p.kc.tau_apl2kc) * dIsdt;
+                // inh_curr = inh_prev + (p.time.dt / p.kc.apl_taum)   * dinhdt;
 
-                Is_curr  = Is_prev  + (p.time.dt / p.kc.tau_apl2kc) * dIsdt;
-                inh_curr = inh_prev + (p.time.dt / p.kc.apl_taum)   * dinhdt;
-
-                Is(0,t)  = Is_curr;   // log global
+                Is_curr  = Is_curr_per_comp.sum();
+                inh_curr = inh_curr_per_comp.sum();
+                Is(0,t)  = Is_curr;
                 inh(0,t) = inh_curr;
 
                 // (6) Vesicles + thresholding (unchanged)
@@ -1550,21 +1784,29 @@ void sim_KC_layer(
 
                 // Next step
                 std::swap(Is_prev_per_comp,  Is_curr_per_comp);
+                std::swap(Vm_apl_prev_per_comp, Vm_apl_curr_per_comp);
                 std::swap(inh_prev_per_comp, inh_curr_per_comp);
                 Is_prev  = Is_curr;
                 inh_prev = inh_curr;
             }
         } else {
             Column dKCdt;
+            double total_kc_apl_drive = 0.0; 
+            double total_claw_apl_drive = 0.0; 
             double total_claw_drive = 0.0;
             double total_pn_drive = 0.0;
             double total_kc_apl_inh = 0.0;
+            //const Eigen::Index n_claws = rv.kc.claw_to_kc.size();
             for (unsigned t = p.time.start_step()+1; t < p.time.steps_all(); t++) { 
                 // Calculate the KC-level activity, a vector of size (p.kc.N, 1)
                 Eigen::VectorXd kc_activity = (nves.col(t-1).array() * spikes.col(t-1).array()).matrix();
 
                 // Sum the weighted activity of all KCs to get a single APL input value.
                 // This resolves the dimension mismatch.
+                Eigen::VectorXd claw_drive = rv.kc.wPNKC * pn_t.col(t);       // size = nClaws
+                double claw_apl_drive = rv.kc.wKCAPL.col(0).dot(claw_drive);
+                claw_apl_drive = claw_apl_drive * 0.2;
+
                 double kc_apl_drive = 0.0;
                 const Eigen::Index n_claws = rv.kc.claw_to_kc.size();
                 for (Eigen::Index claw = 0; claw < n_claws; ++claw) {
@@ -1572,14 +1814,22 @@ void sim_KC_layer(
                     kc_apl_drive += rv.kc.wKCAPL(claw, 0) * kc_activity[kc];
                 }
 
-                double dIsdt = -Is(t-1) + kc_apl_drive * 1e4;
+                total_kc_apl_drive += kc_apl_drive * 1e4;
+                total_claw_apl_drive += claw_apl_drive;
+
+                double dIsdt; 
+                if(!p.kc.pn_claw_to_APL){
+                    dIsdt = -Is(t-1) + kc_apl_drive * 1e4;
+                } else {
+                    dIsdt = -Is(t-1) + claw_apl_drive;
+                }
+
 
                 double dinhdt = -inh(t-1) + Is(t-1);
                 // claw-level drive: one entrty per claw
                 // rv.kc.wPNKC: a matrix of size (nClaws x nGlos)
                 // pn_t.col(t): a vector of size (nGloms) givine the PN activity at time step t.
                 // multiplication: standard matrix-vector, a length-nClaws VectorXd
-                Eigen::VectorXd claw_drive = rv.kc.wPNKC * pn_t.col(t);       // size = nClaws
 
                 // collapse to true KC-level drive
                 // initialize KC-level accumulator
@@ -1601,6 +1851,8 @@ void sim_KC_layer(
                     kc_apl_inh[kc] += rv.kc.wAPLKC(claw, 0) * inh(t - 1);
                 }
 
+                kc_apl_inh = kc_apl_inh * 1;
+
                 total_claw_drive += claw_drive.mean();
                 total_pn_drive += pn_drive.mean();
                 total_kc_apl_inh += kc_apl_inh.mean();
@@ -1610,18 +1862,21 @@ void sim_KC_layer(
                     + pn_drive
                     - kc_apl_inh).array() // Now this term has the correct size
                     - use_ffapl * ffapl_t(t-1);
- 
+     
                 Vm.col(t) = Vm.col(t-1) + dKCdt*p.time.dt/p.kc.taum;
                 inh(t)    = inh(t-1)    + dinhdt*p.time.dt/p.kc.apl_taum;
                 Is(t)     = Is(t-1)     + dIsdt*p.time.dt/p.kc.tau_apl2kc;
 
                 nves.col(t) = nves.col(t-1);
-                nves.col(t) += p.time.dt*((1.0-nves.col(t-1).array()).matrix()/p.kc.tau_r) - (p.kc.ves_p*spikes.col(t-1).array()*nves.col(t-1).array()).matrix();
+                nves.col(t) += p.time.dt*((1.0-nves.col(t-1).array()).matrix()/p.kc.tau_r) - (p.kc.ves_p *spikes.col(t-1).array()*nves.col(t-1).array()).matrix();
 
                 auto const thr_comp = Vm.col(t).array() > rv.kc.thr.array();
                 spikes.col(t) = thr_comp.select(1.0, spikes.col(t)); // either go to 1 or _stay_ at 0.
                 Vm.col(t) = thr_comp.select(0.0, Vm.col(t)); // very abrupt repolarization!
             }
+            // rv.log(cat("mean claw_apl_drive ", total_claw_apl_drive / p.time.steps_all()));
+            // rv.log(cat("mean kc_apl_drive ", total_kc_apl_drive / p.time.steps_all()));
+            // rv.log(cat("mean kc_apl_inh ", total_kc_apl_inh/ p.time.steps_all()));
         }
     } else {
         Column dKCdt;
@@ -1665,12 +1920,10 @@ void sim_KC_layer(
             spikes.col(t) = thr_comp.select(1.0, spikes.col(t)); // either go to 1 or _stay_ at 0.
             Vm.col(t) = thr_comp.select(0.0, Vm.col(t)); // very abrupt repolarization!
         }
-        //rv.log(cat("kc_apl_drive mean: ", kc_apl_drive_ts.mean()));
-        // rv.log(cat("VM mean: ", Vm.mean()));
+        // rv.log(cat("kc_apl_drive mean: ", kc_apl_drive_ts.mean()));
         // rv.log(cat("After sim_KC_layer: ", "wAPLKC mean: ", rv.kc.wAPLKC.mean(), ", ", "Vm mean: ", Vm.mean(), ", ", "Spikes mean: ", spikes.mean()));
     }
 } 
-
 
 void run_ORN_LN_sims(ModelParams const& p, RunVars& rv) {
     std::vector<unsigned> simlist = get_simlist(p);
@@ -1698,8 +1951,8 @@ void run_ORN_LN_sims(ModelParams const& p, RunVars& rv) {
                     rv.ln.inhA.sims[i], rv.ln.inhB.sims[i]);
                     */
         }
-        rv.log(cat("orn_t.rows: ", orn_t.rows()));
-        rv.log(cat("orn_t.cols: ", orn_t.cols()));
+        //rv.log(cat("orn_t.rows: ", orn_t.rows()));
+        //rv.log(cat("orn_t.cols: ", orn_t.cols()));
     }
 }
 void run_PN_sims(ModelParams const& p, RunVars& rv) {
