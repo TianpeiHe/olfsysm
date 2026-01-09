@@ -1,12 +1,50 @@
 #include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
+#include <pybind11/numpy.h>
 #include <pybind11/eigen.h>
+#include <Eigen/Sparse>
+#include <pybind11/stl.h>
 
 #include <memory>
 
 #include "olfsysm.hpp"
 
 namespace py = pybind11;
+
+static Eigen::SparseMatrix<double, Eigen::RowMajor>
+csr_to_eigen_sparse_rowmajor(py::object csr) {
+    py::object data_obj    = csr.attr("data");
+    py::object indices_obj = csr.attr("indices");
+    py::object indptr_obj  = csr.attr("indptr");
+    py::tuple shape        = csr.attr("shape").cast<py::tuple>();
+
+    const int rows = shape[0].cast<int>();
+    const int cols = shape[1].cast<int>();
+
+    py::array_t<double, py::array::c_style | py::array::forcecast> data(data_obj);
+    py::array_t<int,    py::array::c_style | py::array::forcecast> indices(indices_obj);
+    py::array_t<int,    py::array::c_style | py::array::forcecast> indptr(indptr_obj);
+
+    auto data_r    = data.unchecked<1>();
+    auto indices_r = indices.unchecked<1>();
+    auto indptr_r  = indptr.unchecked<1>();
+
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve((size_t)data_r.shape(0));
+
+    for (int i = 0; i < rows; ++i) {
+        const int start = indptr_r(i);
+        const int end   = indptr_r(i + 1);
+        for (int k = start; k < end; ++k) {
+            triplets.emplace_back(i, indices_r(k), data_r(k));
+        }
+    }
+
+    Eigen::SparseMatrix<double, Eigen::RowMajor> W(rows, cols);
+    W.setFromTriplets(triplets.begin(), triplets.end());
+    W.makeCompressed();
+    return W;
+}
+
 
 PYBIND11_MODULE(olfsysm, m) {
 	/* TODO fill this in from his other docs */
@@ -136,6 +174,22 @@ PYBIND11_MODULE(olfsysm, m) {
         .def_readwrite("allow_net_inh_per_claw", &ModelParams::KC::allow_net_inh_per_claw)
         .def_readwrite("comp_num", &ModelParams::KC::comp_num)
         .def_readwrite("apl_coup_const", &ModelParams::KC::apl_coup_const)
+        .def_property(
+            "claw_distance_matrix",
+            // getter: optional; return None (or you can implement a converter back later)
+            [](ModelParams::KC const&) {
+                return py::none();
+            },
+            // setter: accepts scipy.sparse.csr_matrix and converts to Eigen sparse
+            [](ModelParams::KC& kc, py::object csr) {
+                if (csr.is_none()) {
+                    kc.claw_distance_matrix.resize(0, 0);
+                    kc.claw_distance_matrix.setZero();
+                    return;
+                }
+                kc.claw_distance_matrix = csr_to_eigen_sparse_rowmajor(csr);
+            }
+        )
         ;
 
 
