@@ -1,4 +1,4 @@
-  #ifndef OLFSYSM_H_
+#ifndef OLFSYSM_H_
 #define OLFSYSM_H_
 
 #include <vector>
@@ -6,7 +6,10 @@
 #include <functional>
 #include <mutex>
 #include <fstream>
+#include <variant> 
 #include "Eigen/Dense"
+#include <Eigen/Sparse>
+
 
 /* Used for thread-safe logging. */
 class Logger {
@@ -267,7 +270,10 @@ struct ModelParams {
         double tau_apl2kc;
 
         /* APL compartment coupling constants*/
-        double apl_coup_const;
+        // std::variant<double, Eigen::MatrixXd> apl_coup_const;
+        double apl_coup_const; 
+        Eigen::SparseMatrix<double, Eigen::RowMajor> claw_distance_matrix;
+        
         int comp_num;
 
         /* Synaptic depression params; see Hennig 2013 equation 3. Synaptic

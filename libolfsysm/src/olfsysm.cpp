@@ -16,6 +16,8 @@
 #include <map>
 #include <cmath>
 #include <stdexcept>
+#include <variant>
+
 
 /* So code can be compiled single threaded, to support debugging.
  * Only other OMP references should be in the preprocessor directives, which I think can
@@ -1532,394 +1534,807 @@ void sim_FFAPL_layer(
         ffapl_t = ffapl_t.array() - spont;
     }
 }
-
 void sim_KC_layer(
     ModelParams const& p, RunVars const& rv,
     Matrix const& pn_t, Vector const& ffapl_t,
     Matrix& Vm, Matrix& spikes, Matrix& nves, Matrix& inh, Matrix& Is,
     Matrix& claw_sims) {
+
     /* Args:
      * - inh: APL potential timeseries
      * - Is: KC->APL synapse current (across all KCs) timeseries
-     * */
+     */
 
-    // Determine number of compartments
-    // int n_compartments = rv.kc.claw_compartments.maxCoeff() + 1;
+    // Initialize state
     Vm.setZero();
     spikes.setZero();
-    // TODO why setOnes here?
     nves.setOnes();
     inh.setZero();
     Is.setZero();
 
     float use_ffapl = float(!p.kc.ignore_ffapl);
-    if (p.kc.wPNKC_one_row_per_claw) {
-        const Eigen::Index n_claws = rv.kc.claw_to_kc.size();
-        // TODO log n_claws
+    
 
-        // TODO try to move outside of sim_KC_layer (at least the resize()?)?
-        // (still need? delete?)
-        // TODO this able to correct for initial size not being specified
-        // correctly? (yes, seems so. may be slower doing it in here tho)
-        claw_sims.resize(n_claws, p.time.steps_all());
-
-        claw_sims.setZero();
-
-        if (p.kc.apl_coup_const != -1) {
-            // --- setup (unchanged pieces omitted) ---
-            // --- Setup ---
-            const auto& claws_by_compartment = rv.kc.compartment_to_claws;
-            const int num_comp = int(claws_by_compartment.size());
-            double g_voltage_coup = p.kc.apl_coup_const;
-
-            // --- State Variables ---
-            Eigen::VectorXd Is_prev_per_comp   = Eigen::VectorXd::Zero(num_comp);
-            Eigen::VectorXd Is_curr_per_comp   = Is_prev_per_comp;
-            
-            // APL has its own membrane potential, which replaces 'inh' for feedback
-            Eigen::VectorXd Vm_apl_prev_per_comp = Eigen::VectorXd::Zero(num_comp);
-            Eigen::VectorXd Vm_apl_curr_per_comp = Vm_apl_prev_per_comp;
-
-            // 'inh' is preserved for other uses but not for feedback in this loop
-            Eigen::VectorXd inh_prev_per_comp  = Eigen::VectorXd::Zero(num_comp);
-            Eigen::VectorXd inh_curr_per_comp  = inh_prev_per_comp;
-
-            // Scalars evolve in lock-step as sums of vectors
-            double inh_prev = inh_prev_per_comp.sum();
-            double Is_prev  = Is_prev_per_comp.sum();
-            double inh_curr = inh_prev;
-            double Is_curr  = Is_prev;
-
-            // TODO TODO TODO shouldn't rest of values be filled in? am i missing
-            // something?
-            inh(0,0) = inh_prev;   // log scalar aggregates (global)
-            Is(0,0)  = Is_prev;
-
-            // (rest of setup is the same)
-            Column dKCdt;
-            Eigen::VectorXd comp_drive(num_comp);
-            Eigen::VectorXd pn_drive(p.kc.N);
-            Eigen::VectorXd kc_apl_inh(p.kc.N);
-
-            // TODO better names for these (/ remove need for them -> delete)
-            // (why are they sometimes not a rowvec/colvec, b/c they are matrices then?)
-            const bool wkcapl_rowvec = (rv.kc.wKCAPL.rows() == 1);
-            const bool waplkc_colvec = (rv.kc.wAPLKC.cols() == 1);
-
-            for (unsigned t = p.time.start_step() + 1; t < p.time.steps_all(); ++t) {
-                // (1) KC -> APL drive per compartment (Unchanged)
-                const Eigen::VectorXd kc_activity =
-                    (nves.col(t-1).array() * spikes.col(t-1).array()).matrix();
-
-                Eigen::VectorXd claw_drive(rv.kc.wPNKC.rows());
-                claw_drive.noalias() = rv.kc.wPNKC * pn_t.col(t);
-
-                comp_drive.setZero();
-
-                if(!p.kc.pn_claw_to_APL){
-                    for (int comp = 0; comp < num_comp; ++comp) {
-                        double s = 0.0;
-                        for (int claw : claws_by_compartment[(size_t)comp]) {
-                            const unsigned kc = rv.kc.claw_to_kc[(Eigen::Index)claw];
-                            const double w_kc_apl = wkcapl_rowvec ? rv.kc.wKCAPL(0, claw) : rv.kc.wKCAPL(claw, 0);
-                            s += w_kc_apl * kc_activity[kc];
-                        }
-                        comp_drive[comp] = 1e4 * s;
-                    }
-                } else {
-                    for (int comp = 0; comp < num_comp; ++comp) {
-                        double s = 0.0;
-                        for (int claw : claws_by_compartment[(size_t)comp]) {
-                            const double w_kc_apl = wkcapl_rowvec ? rv.kc.wKCAPL(0, claw) : rv.kc.wKCAPL(claw, 0);
-                            s += w_kc_apl * claw_drive[claw];
-                        }
-                        comp_drive[comp] = 0.2 * s;
-                    }
-                }
-                // (2) APL Internal Dynamics (REVISED)
-                // (2a) The synaptic current 'Is' is updated as before.
-                Eigen::VectorXd dIs_comp_dt = -Is_prev_per_comp + comp_drive; 
-
-                // (2b) Calculate APL voltage change using the simplified capacitive model.
-                Eigen::VectorXd dVm_apl_dt = Eigen::VectorXd::Zero(num_comp);
-                const double inv_Cm = 1.0 / p.kc.apl_Cm;       // The single new parameter
-                const double inv_taum = 1.0 / p.kc.apl_taum; // Existing parameter
-
-                for (int c = 0; c < num_comp; ++c) {
-                    // Synaptic current from KCs
-                    const double I_syn = Is_prev_per_comp[c];
-
-                    // Electrical coupling current from neighbors
-                    const int L = (c - 1 + num_comp) % num_comp;
-                    const int R = (c + 1) % num_comp;
-                    const double I_coupling = g_voltage_coup * (Vm_apl_prev_per_comp[L] + Vm_apl_prev_per_comp[R]
-                                                            - 2.0 * Vm_apl_prev_per_comp[c]);
-                    
-                    // Sum the currents
-                    const double I_total = I_syn + I_coupling;
-
-                    // The change in voltage is the leak plus the integrated total current.
-                    // dV/dt = -V/tau + I_total/Cm
-                    dVm_apl_dt[c] = -inv_taum * Vm_apl_prev_per_comp[c] + inv_Cm * I_total;
-                }
-
-                // (2c) 'inh' variable is updated as before for other uses.
-                Eigen::VectorXd dInh_comp_dt = -inh_prev_per_comp + Is_prev_per_comp;
-
-                double dIsdt  = dIs_comp_dt.sum();
-                double dinhdt = dInh_comp_dt.sum();
-
-                // (3) APL -> KC Feedback (MODIFIED)
-                pn_drive.setZero();
-                kc_apl_inh.setZero();
-
-                // use the *vector* per-compartment inhibition (previous step)
-                for (int comp=0; comp<num_comp; ++comp) {
-                    const double apl_comp_prev = inh_prev_per_comp[comp];
-
-                    for (int claw : claws_by_compartment[(size_t)comp]) {
-                        const unsigned kc = rv.kc.claw_to_kc[(Eigen::Index)claw];
-                        pn_drive[kc] += claw_drive[claw];
-
-                        // TODO delete need for this (seems it's effectively 1D either
-                        // way. just have both branches initialize w/ consistent dim
-                        // order...)
-                        const double w_apl_kc = waplkc_colvec ? rv.kc.wAPLKC(claw, 0)
-                                                            : rv.kc.wAPLKC(0, claw);
-                        // compartment-specific inhibition:
-                        kc_apl_inh[kc] += w_apl_kc * apl_comp_prev;
-                    }
-                }
-
-                dKCdt = (-Vm.col(t-1) + pn_drive - kc_apl_inh).array()
-                        - float(!p.kc.ignore_ffapl) * ffapl_t(t-1);
-                Vm.col(t) = Vm.col(t-1) + dKCdt * (p.time.dt / p.kc.taum);
-
-                // (5) Advance APL state variables (Unchanged from previous version)
-                Is_curr_per_comp   = Is_prev_per_comp   + (p.time.dt / p.kc.tau_apl2kc) * dIs_comp_dt;
-                inh_curr_per_comp  = inh_prev_per_comp  + (p.time.dt / p.kc.apl_taum)   * dInh_comp_dt;
-                Vm_apl_curr_per_comp = Vm_apl_prev_per_comp + p.time.dt * dVm_apl_dt;
-                
-                Is_curr  = Is_prev  + (p.time.dt / p.kc.tau_apl2kc) * dIsdt;
-                inh_curr = inh_prev + (p.time.dt / p.kc.apl_taum)   * dinhdt;
-
-                // Is_curr  = Is_curr_per_comp.sum();
-                // inh_curr = inh_curr_per_comp.sum();
-                Is(0,t)  = Is_curr;
-                inh(0,t) = inh_curr;
-
-                // (6) Vesicles + thresholding (unchanged)
-                nves.col(t) = nves.col(t-1);
-                nves.col(t) += p.time.dt * ((1.0 - nves.col(t-1).array()).matrix()/p.kc.tau_r)
-                            - (p.kc.ves_p * spikes.col(t-1).array() * nves.col(t-1).array()).matrix();
-
-                auto const over_thr = Vm.col(t).array() > rv.kc.thr.array();
-                spikes.col(t) = over_thr.select(1.0, spikes.col(t));
-                Vm.col(t)     = over_thr.select(0.0, Vm.col(t));
-
-                // TODO what is this doing?
-                std::swap(Is_prev_per_comp,  Is_curr_per_comp);
-                std::swap(Vm_apl_prev_per_comp, Vm_apl_curr_per_comp);
-                std::swap(inh_prev_per_comp, inh_curr_per_comp);
-                Is_prev  = Is_curr;
-                inh_prev = inh_curr;
+    const bool has_claws       = p.kc.wPNKC_one_row_per_claw;
+    bool has_coupled_apl = false;
+    bool acp_is_double = true; 
+    if (has_claws){
+        if (p.kc.apl_coup_const !=-1){
+            has_coupled_apl = true;
+            if (p.kc.claw_distance_matrix.size() > 0) {
+                acp_is_double = false;
             }
-        } else {
-            Column dKCdt;
-            double total_kc_apl_drive = 0.0; 
-            double total_claw_apl_drive = 0.0; 
-            // double total_claw_drive = 0.0;
-            // double total_pn_drive = 0.0;
-            // double total_kc_apl_inh = 0.0;
-            //const Eigen::Index n_claws = rv.kc.claw_to_kc.size();
-            for (unsigned t = p.time.start_step()+1; t < p.time.steps_all(); t++) { 
-                // Calculate the KC-level activity, a vector of size (p.kc.N, 1)
-                Eigen::VectorXd kc_activity = (
-                    nves.col(t-1).array() * spikes.col(t-1).array()
-                ).matrix();
-
-                // Sum the weighted activity of all KCs to get a single APL input value.
-                // This resolves the dimension mismatch.
-                Eigen::VectorXd claw_drive = rv.kc.wPNKC * pn_t.col(t);       // size = nClaws
-                double claw_apl_drive = rv.kc.wKCAPL.col(0).dot(claw_drive);
-                claw_apl_drive = claw_apl_drive * 0.2;
-
-                double kc_apl_drive = 0.0;
-                for (Eigen::Index claw=0; claw<n_claws; ++claw) {
-                    unsigned kc = rv.kc.claw_to_kc[claw];
-                    // TODO TODO TODO do we want to require the KCs to spike tho? if
-                    // not, how to get math to work out somewhat similar to before, when
-                    // this was fully dependent on KCs spiking (tuning may mostly take
-                    // care of that?)
-                    // TODO TODO TODO add flag to control whether this depends on
-                    // spiking or not (should directly depend on claw activities if not)
-                    kc_apl_drive += rv.kc.wKCAPL(claw) * kc_activity[kc];
-                }
-
-                // rv.kc.wPNKC: a matrix of size (nClaws x nGloms)
-                // pn_t.col(t): a vector of size (nGloms) giving the PN activity at time
-                // step t.
-                Eigen::VectorXd claw_drive_with_inh = (
-                    // all of these have 1 col and #-claws rows (e.g. 9472),
-                    // as does claw_sims.col(t)
-                    claw_drive - rv.kc.wAPLKC * inh(t-1)
-                );
-
-                // TODO TODO TODO also set claw_sims in `apl_coup_const != -1` case
-                // above (+ change math in same manner changed below), and also use
-                // allow_net_inh_per_claw (alongside slight change to calculation, to
-                // operate within each claw first) in that case
-                //
-                // TODO rename to something w/ units? what are proper units (and do they
-                // make sense as-is? does it really matter?)?
-                claw_sims.col(t) = claw_drive_with_inh;
-
-                if (!p.kc.allow_net_inh_per_claw) {
-                    // there typically will be claws that would get sent negative b/c of
-                    // inhibition, so we do need to clip if we want to avoid single
-                    // claws contribution inhibition exceeding their excitation
-                    auto const claw_drives_lt0 = claw_sims.col(t).array() < 0;
-                    // replace per-claw drives to min of 0
-                    claw_sims.col(t) = claw_drives_lt0.select(0.0, claw_sims.col(t));
-                    check(claw_sims.col(t).minCoeff() >= 0);
-                }
-
-                total_kc_apl_drive += kc_apl_drive * 1e4;
-                total_claw_apl_drive += claw_apl_drive;
-
-                double dIsdt; 
-                if(!p.kc.pn_claw_to_APL){
-                    dIsdt = -Is(t-1) + kc_apl_drive * 1e4;
-                } else {
-                    dIsdt = -Is(t-1) + claw_apl_drive;
-                }
-
-                double dinhdt = -inh(t-1) + Is(t-1);
-
-                Eigen::VectorXd pn_drive = Eigen::VectorXd::Zero(p.kc.N);
-                for (Eigen::Index claw=0; claw<n_claws; ++claw) {
-                    unsigned kc = rv.kc.claw_to_kc[claw];
-                    pn_drive[kc] += claw_sims(claw, t);
-                }
-
-                Eigen::VectorXd kc_apl_inh = Eigen::VectorXd::Zero(p.kc.N); // size = nKCs  
-                for (Eigen::Index claw = 0; claw < n_claws; ++claw) {
-                    unsigned kc = rv.kc.claw_to_kc[claw];
-                    // The APL inhibition is weighted by the APL->KC weight
-                    // and applied to the corresponding KC.
-                    kc_apl_inh[kc] += rv.kc.wAPLKC(claw, 0) * inh(t - 1);
-                }
-
-                // dKCdt =
-                //     (-Vm.col(t-1)
-                //     + pn_drive
-                //     - kc_apl_inh).array() // Now this term has the correct size
-                //     - use_ffapl * ffapl_t(t-1);
-     
-                dKCdt = (-Vm.col(t-1) + pn_drive).array() - use_ffapl * ffapl_t(t-1);
-
-                // total_claw_drive += claw_drive.mean();
-                // total_pn_drive += pn_drive.mean();
-                // total_kc_apl_inh += kc_apl_inh.mean();
-                // --- Now use the correctly sized KC-level inhibition ---
-                // dKCdt =
-                //     (-Vm.col(t-1)
-                //     + pn_drive
-                //     - kc_apl_inh).array() // Now this term has the correct size
-                //     - use_ffapl * ffapl_t(t-1);
-     
-                Vm.col(t) = Vm.col(t-1) + dKCdt*p.time.dt/p.kc.taum;
-                inh(t)    = inh(t-1)    + dinhdt*p.time.dt/p.kc.apl_taum;
-                Is(t)     = Is(t-1)     + dIsdt*p.time.dt/p.kc.tau_apl2kc;
-
-                nves.col(t) = nves.col(t-1);
-                nves.col(t) += (p.time.dt *
-                    ((1.0 - nves.col(t-1).array()).matrix() / p.kc.tau_r) -
-                    (p.kc.ves_p*spikes.col(t-1).array() *
-                     nves.col(t-1).array()).matrix()
-                );
-
-                auto const thr_comp = Vm.col(t).array() > rv.kc.thr.array();
-                // either go to 1 or _stay_ at 0.
-                spikes.col(t) = thr_comp.select(1.0, spikes.col(t));
-                // very abrupt repolarization!
-                Vm.col(t) = thr_comp.select(0.0, Vm.col(t));
-            }
-            // rv.log(cat("mean claw_apl_drive ", total_claw_apl_drive / p.time.steps_all()));
-            // rv.log(cat("mean kc_apl_drive ", total_kc_apl_drive / p.time.steps_all()));
-            // rv.log(cat("mean kc_apl_inh ", total_kc_apl_inh/ p.time.steps_all()));
         }
-    } else {
-        Column dKCdt;
-        Eigen::VectorXd kc_apl_drive_ts;
-        const unsigned t0 = p.time.start_step() + 1;
-        const unsigned tN = p.time.steps_all();
-        // TODO describe what this is doing
+    }
+    
+
+    // --------------------------------------------------------------------
+    // Branch-specific state
+    // --------------------------------------------------------------------
+
+    // Per-compartment APL (used only when has_coupled_apl)
+    Eigen::VectorXd Is_prev_per_comp, Is_curr_per_comp;
+    Eigen::VectorXd Vm_apl_prev_per_comp, Vm_apl_curr_per_comp;
+    Eigen::VectorXd inh_prev_per_comp, inh_curr_per_comp;
+    int num_comp = 0;
+    double Is_prev_scalar  = 0.0;
+    double Is_curr_scalar  = 0.0;
+    double inh_prev_scalar = 0.0;
+    double inh_curr_scalar = 0.0;
+
+    const auto& claws_by_compartment = rv.kc.compartment_to_claws;
+
+    if (has_coupled_apl) {
+        num_comp = int(claws_by_compartment.size());
+        Is_prev_per_comp     = Eigen::VectorXd::Zero(num_comp);
+        Is_curr_per_comp     = Is_prev_per_comp;
+        Vm_apl_prev_per_comp = Eigen::VectorXd::Zero(num_comp);
+        Vm_apl_curr_per_comp = Vm_apl_prev_per_comp;
+        inh_prev_per_comp    = Eigen::VectorXd::Zero(num_comp);
+        inh_curr_per_comp    = inh_prev_per_comp;
+
+        // Scalars evolve as sums of compartment values
+        Is_prev_scalar  = Is_prev_per_comp.sum();
+        inh_prev_scalar = inh_prev_per_comp.sum();
+        Is_curr_scalar  = Is_prev_scalar;
+        inh_curr_scalar = inh_prev_scalar;
+
+        // Log scalar aggregates at t = 0
+        inh(0, 0) = inh_prev_scalar;
+        Is(0, 0)  = Is_prev_scalar;
+    }
+
+    // Claw-related allocations
+    const Eigen::Index n_claws = has_claws ? rv.kc.claw_to_kc.size() : 0;
+    if (has_claws) {
+        claw_sims.resize(n_claws, p.time.steps_all());
+        claw_sims.setZero();
+    }
+
+    // Old no-claw branch keeps its time-series of kc_apl_drive (for logging)
+    unsigned tN = p.time.steps_all(); 
+    unsigned t0 = p.time.start_step() + 1;
+    Eigen::VectorXd kc_apl_drive_ts;
+    if (!has_claws) {
         const Eigen::Index T = static_cast<Eigen::Index>(tN - t0);
         kc_apl_drive_ts.resize(T);
         kc_apl_drive_ts.setZero();
-        // vector to store kc_apl_drive in each iteration
-        for (unsigned t = p.time.start_step()+1; t < p.time.steps_all(); t++) {
-            Eigen::VectorXd kc_activity =
-                (nves.col(t-1).array() * spikes.col(t-1).array()).matrix();
-
-            // 1xN * Nx1 -> 1x1, then extract the (0,0) scalar
-            // TODO add assertion shape is actually (1,1) like we expect, before
-            // subsetting?
-            const double kc_apl_drive = (rv.kc.wKCAPL * kc_activity)(0,0);
-            kc_apl_drive_ts(static_cast<Eigen::Index>(t - t0)) = kc_apl_drive;
-            // use the scalar
-            // TODO what is the 1e4 for?
-            const double dIsdt = -Is(t-1) + kc_apl_drive * 1e4;
-            double dinhdt = -inh(t-1) + Is(t-1);
-            dKCdt =
-                (-Vm.col(t-1)
-                +rv.kc.wPNKC*pn_t.col(t)
-                -rv.kc.wAPLKC*inh(t-1)).array()
-                -use_ffapl*ffapl_t(t-1);
-
-            Vm.col(t) = Vm.col(t-1) + dKCdt*p.time.dt/p.kc.taum;
-            inh(t)    = inh(t-1)    + dinhdt*p.time.dt/p.kc.apl_taum;
-            Is(t)     = Is(t-1)     + dIsdt*p.time.dt/p.kc.tau_apl2kc;
-
-            nves.col(t) = nves.col(t-1);
-            nves.col(t) += p.time.dt*((1.0-nves.col(t-1).array()).matrix()/p.kc.tau_r) - (p.kc.ves_p*spikes.col(t-1).array()*nves.col(t-1).array()).matrix();
-
-            auto const thr_comp = Vm.col(t).array() > rv.kc.thr.array();
-            // either go to 1 or _stay_ at 0.
-            spikes.col(t) = thr_comp.select(1.0, spikes.col(t));
-            // TODO add assertion that checks spikes max is 1? or that unique values are
-            // 0/1?
-
-            // TODO describe how exactly this is working
-            // very abrupt repolarization!
-            Vm.col(t) = thr_comp.select(0.0, Vm.col(t));
-        }
-        // rv.log(cat("kc_apl_drive mean: ", kc_apl_drive_ts.mean()));
-        // rv.log(cat("After sim_KC_layer: ", "wAPLKC mean: ", rv.kc.wAPLKC.mean(), ", ", "Vm mean: ", Vm.mean(), ", ", "Spikes mean: ", spikes.mean()));
     }
-    // TODO TODO assert nves is all 1, if ves_p == 0 (which it should be)?
 
-    // TODO TODO TODO even if it seems true that inh/Is are all 0 on the first calls,
-    // when picking threshold: *why* are they 0 there, when it doesnt seem like i was
-    // always properly setting wAPLKC/wKCAPL to 0 for those calls [in case where
-    // preset_*=true, i.e. use_connectome_APL_weights=True in python fit_mb_model]?
-    // (is there something else that changed across the two calls in fit_sparseness?)
-    // TODO delete
-    /*
-    rv.log(cat(
-        "rv.kc.wAPLKC.isZero(): ", rv.kc.wAPLKC.isZero(),
-        " (rv.kc.wAPLKC.array() == 0).all(): ", (rv.kc.wAPLKC.array() == 0.0).all(),
-        "\nrv.kc.wKCAPL.isZero(): ", rv.kc.wKCAPL.isZero(),
-        " (rv.kc.wKCAPL.array() == 0).all(): ", (rv.kc.wKCAPL.array() == 0.0).all(),
-        "\ninh.isZero(): ", inh.isZero(),
-        " (inh.array() == 0.0).all(): ", (inh.array() == 0.0).all(),
-        "\nIs.isZero(): ", Is.isZero(),
-        " (Is.array() == 0.0).all(): ", (Is.array() == 0.0).all()
-    ));
-    */
-    //
+    // Shared temporary for KC dynamics
+    Column dKCdt;
+    Eigen::VectorXd pn_drive(p.kc.N);
+    Eigen::VectorXd kc_apl_inh(p.kc.N);
+
+    // Extra constants for coupled APL branch
+    // const double g_voltage_coup = has_coupled_apl ? p.kc.apl_coup_const : 0.0;
+    
+    double g_voltage_coup = p.kc.apl_coup_const; 
+    const double inv_Cm   = has_coupled_apl ? (1.0 / p.kc.apl_Cm)   : 0.0;
+    const double inv_taum = has_coupled_apl ? (1.0 / p.kc.apl_taum) : 0.0;
+    // --------------------------------------------------------------------
+    // Main time loop (shared)
+    // --------------------------------------------------------------------
+    for (unsigned t = p.time.start_step() + 1; t < p.time.steps_all(); ++t) {
+
+        // --- shared KC "activity": vesicles * spikes at previous time ---
+        Eigen::VectorXd kc_activity =
+            (nves.col(t - 1).array() * spikes.col(t - 1).array()).matrix();
+
+        // Branch-specific defaults
+        pn_drive.setZero();
+        kc_apl_inh.setZero();
+
+        // =================================================================
+        // Branch 1: claws + compartment-coupled APL voltage
+        // (p.kc.wPNKC_one_row_per_claw == true, apl_coup_const != -1)
+        // =================================================================
+        if (has_coupled_apl) {
+            // (1) KC -> APL drive per compartment
+            Eigen::VectorXd claw_drive(rv.kc.wPNKC.rows());
+            claw_drive.noalias() = rv.kc.wPNKC * pn_t.col(t);
+
+            Eigen::VectorXd comp_drive(num_comp);
+            comp_drive.setZero();
+
+            if (!p.kc.pn_claw_to_APL) {
+                for (int comp = 0; comp < num_comp; ++comp) {
+                    double s = 0.0;
+                    for (int claw : claws_by_compartment[(size_t)comp]) {
+                        const unsigned kc =
+                            rv.kc.claw_to_kc[(Eigen::Index)claw];
+                        const double w_kc_apl = rv.kc.wKCAPL(0, claw); 
+                        s += w_kc_apl * kc_activity[kc];
+                    }
+                    comp_drive[comp] = 1e4 * s;
+                    // comp_drive[comp] = 0.2 * s;
+                }
+            } else {
+                for (int comp = 0; comp < num_comp; ++comp) {
+                    double s = 0.0;
+                    for (int claw : claws_by_compartment[(size_t)comp]) {
+                        const double w_kc_apl = rv.kc.wKCAPL(0, claw);
+                        s += w_kc_apl * claw_drive[claw];
+                    }
+                    comp_drive[comp] = 0.2 * s;
+                }
+            }
+            
+            // (2) APL Internal Dynamics (per-compartment Is, Vm_apl, inh)
+            Eigen::VectorXd dIs_comp_dt  = -Is_prev_per_comp + comp_drive;
+            Eigen::VectorXd dVm_apl_dt   = Eigen::VectorXd::Zero(num_comp);
+            Eigen::VectorXd dInh_comp_dt = -inh_prev_per_comp + Is_prev_per_comp;
+            Eigen::VectorXd dclaw_coup; 
+            if (acp_is_double){
+                for (int c = 0; c < num_comp; ++c) {
+                    const double I_syn = Is_prev_per_comp[c];
+
+                    const int L = (c - 1 + num_comp) % num_comp;
+                    const int R = (c + 1) % num_comp;
+                    const double I_coupling =
+                        g_voltage_coup *
+                        (Vm_apl_prev_per_comp[L] +
+                        Vm_apl_prev_per_comp[R] -
+                        2.0 * Vm_apl_prev_per_comp[c]);
+
+                    const double I_total = I_syn + I_coupling;
+
+                    // dV/dt = -V/tau + I_total/Cm
+                    dVm_apl_dt[c] =
+                        -inv_taum * Vm_apl_prev_per_comp[c] +
+                        inv_Cm * I_total;
+                }
+            } else {
+                // Dense Laplacian coupling using MatrixXd claw_distance_matrix
+                // dclaw_coup = W*V - (rowSum(W) ⊙ V)
+                dclaw_coup.resize(num_comp);
+                dclaw_coup.setZero();
+
+                // W * V
+                dclaw_coup.noalias() =
+                    p.kc.claw_distance_matrix * Vm_apl_prev_per_comp;
+
+                // Subtract rowSum(W) ⊙ V
+                for (int c = 0; c < num_comp; ++c) {
+                    const double row_sum =
+                        p.kc.claw_distance_matrix.row(c).sum();
+                    dclaw_coup[c] -= row_sum * Vm_apl_prev_per_comp[c];
+                }
+
+                // Use coupling current exactly like the ring-coupling branch
+                for (int c = 0; c < num_comp; ++c) {
+                    const double I_syn = Is_prev_per_comp[c];
+                    const double I_coupling = g_voltage_coup * dclaw_coup[c];
+                    const double I_total = I_syn + I_coupling;
+
+                    // dV/dt = -V/tau + I_total/Cm
+                    dVm_apl_dt[c] =
+                        -inv_taum * Vm_apl_prev_per_comp[c] +
+                        inv_Cm * I_total;
+                }
+            }
+
+            const double dIsdt  = dIs_comp_dt.sum();
+            const double dinhdt = dInh_comp_dt.sum();
+
+            // (3) APL -> KC Feedback
+            pn_drive.setZero();
+            kc_apl_inh.setZero();
+
+            for (int comp = 0; comp < num_comp; ++comp) {
+                double total_apl_effect = 0; 
+                if(acp_is_double){
+                    double total_apl_effect =
+                        std::max(0.0, Vm_apl_prev_per_comp[comp]);
+                }else{
+                    double total_apl_effect =
+                        std::max(0.0, Vm_apl_prev_per_comp[comp]);
+                }
+
+                for (int claw : claws_by_compartment[(size_t)comp]) {
+                    const unsigned kc =
+                        rv.kc.claw_to_kc[(Eigen::Index)claw];
+                    pn_drive[kc] += claw_drive[claw];
+                    const double w_apl_kc = rv.kc.wAPLKC(claw,0);
+                    kc_apl_inh[kc] += w_apl_kc * total_apl_effect;
+                }
+            }
+
+            // (4) KC dynamics: compute dKCdt here; Vm updated below (shared)
+            dKCdt =
+                (-Vm.col(t - 1) + pn_drive - kc_apl_inh).array()
+                - use_ffapl * ffapl_t(t - 1);
+
+            // (5) Advance APL state variables (per-comp + scalar aggregates)
+            Is_curr_per_comp =
+                Is_prev_per_comp +
+                (p.time.dt / p.kc.tau_apl2kc) * dIs_comp_dt;
+            inh_curr_per_comp =
+                inh_prev_per_comp +
+                (p.time.dt / p.kc.apl_taum) * dInh_comp_dt;
+            Vm_apl_curr_per_comp =
+                Vm_apl_prev_per_comp + p.time.dt * dVm_apl_dt;
+
+            Is_curr_scalar =
+                Is_prev_scalar +
+                (p.time.dt / p.kc.tau_apl2kc) * dIsdt;
+            inh_curr_scalar =
+                inh_prev_scalar +
+                (p.time.dt / p.kc.apl_taum) * dinhdt;
+
+            // Log scalar aggregates (as before: row 0, col t)
+            Is(0, t)  = Is_curr_scalar;
+            inh(0, t) = inh_curr_scalar;
+
+            // Swap previous/current for next iteration
+            std::swap(Is_prev_per_comp,    Is_curr_per_comp);
+            std::swap(Vm_apl_prev_per_comp, Vm_apl_curr_per_comp);
+            std::swap(inh_prev_per_comp,   inh_curr_per_comp);
+            Is_prev_scalar  = Is_curr_scalar;
+            inh_prev_scalar = inh_curr_scalar;
+
+            if(t % 500 == 0){
+                rv.log(cat("[KC dbg] t=", t,
+                    " dKCdt.sum=", dKCdt.sum(),
+                    " dKCdt.mean=", dKCdt.mean(),
+                    " dKCdt.min=", dKCdt.minCoeff(),
+                    " dKCdt.max=", dKCdt.maxCoeff(),
+                    " Vm.mean=", Vm.col(t - 1).mean(),
+                    " pn_drive.sum=", pn_drive.sum(),
+                    " pn_drive.mean=", pn_drive.mean(),
+                    " kc_apl_inh.sum=", kc_apl_inh.sum(),
+                    " kc_apl_inh.mean=", kc_apl_inh.mean(),
+                    " ffapl=", (use_ffapl ? ffapl_t(t - 1) : 0.0)
+                    ));
+
+                rv.log(cat("[APL dbg] t=", t,
+                    " comp_drive.sum=", comp_drive.sum(),
+                    " comp_drive.mean=", comp_drive.mean(),
+                    " comp_drive.min=", comp_drive.minCoeff(),
+                    " comp_drive.max=", comp_drive.maxCoeff(),
+                    " Is_prev.sum=", Is_prev_per_comp.sum(),
+                    " Vm_apl_prev.sum=", Vm_apl_prev_per_comp.sum(),
+                    " Vm_apl_prev.min=", Vm_apl_prev_per_comp.minCoeff(),
+                    " Vm_apl_prev.max=", Vm_apl_prev_per_comp.maxCoeff()
+                    ));
+            }
+        }
+
+
+        // =================================================================
+        // Branch 2: claws, scalar APL (no compartment coupling)
+        // (p.kc.wPNKC_one_row_per_claw == true, apl_coup_const == -1)
+        // =================================================================
+        else if (has_claws) {
+            static double total_kc_apl_drive   = 0.0;
+            static double total_claw_apl_drive = 0.0;
+
+            Eigen::VectorXd claw_drive = rv.kc.wPNKC * pn_t.col(t);
+
+            double claw_apl_drive = rv.kc.wKCAPL.col(0).dot(claw_drive);
+            claw_apl_drive *= 0.2;
+
+            double kc_apl_drive = 0.0;
+            for (Eigen::Index claw = 0; claw < n_claws; ++claw) {
+                unsigned kc = rv.kc.claw_to_kc[claw];
+                kc_apl_drive += rv.kc.wKCAPL(0, claw) * kc_activity[kc];
+            }
+
+            Eigen::VectorXd claw_drive_with_inh =
+                claw_drive - rv.kc.wAPLKC * inh(t - 1);
+
+            claw_sims.col(t) = claw_drive_with_inh;
+
+            if (!p.kc.allow_net_inh_per_claw) {
+                auto const claw_drives_lt0 = claw_sims.col(t).array() < 0;
+                claw_sims.col(t) = claw_drives_lt0.select(0.0, claw_sims.col(t));
+                check(claw_sims.col(t).minCoeff() >= 0);
+            }
+
+            total_kc_apl_drive   += kc_apl_drive * 1e4;
+            total_claw_apl_drive += claw_apl_drive;
+
+            double dIsdt;
+            if (!p.kc.pn_claw_to_APL) {
+                dIsdt = -Is(t - 1) + kc_apl_drive * 1e4;
+            } else {
+                dIsdt = -Is(t - 1) + claw_apl_drive;
+            }
+
+            double dinhdt = -inh(t - 1) + Is(t - 1);
+
+            pn_drive.setZero();
+            for (Eigen::Index claw = 0; claw < n_claws; ++claw) {
+                unsigned kc = rv.kc.claw_to_kc[claw];
+                pn_drive[kc] += claw_sims(claw, t);
+            }
+
+            // kc_apl_inh is computed but NOT used in dKCdt (matches original)
+            kc_apl_inh.setZero();
+            for (Eigen::Index claw = 0; claw < n_claws; ++claw) {
+                unsigned kc = rv.kc.claw_to_kc[claw];
+                kc_apl_inh[kc] += rv.kc.wAPLKC(claw, 0) * inh(t - 1);
+            }
+
+            // KC dynamics: note no subtraction of kc_apl_inh, matching original
+            dKCdt =
+                (-Vm.col(t - 1) + pn_drive).array()
+                - use_ffapl * ffapl_t(t - 1);
+
+            // Scalar inh / Is dynamics (same as original branch)
+            inh(t) = inh(t - 1) +
+                     dinhdt * p.time.dt / p.kc.apl_taum;
+            Is(t)  = Is(t - 1) +
+                     dIsdt  * p.time.dt / p.kc.tau_apl2kc;
+
+        }
+
+        // =================================================================
+        // Branch 3: no claws, matrix wPNKC / wKCAPL
+        // (!p.kc.wPNKC_one_row_per_claw)
+        // =================================================================
+        else {
+            const double kc_apl_drive =
+                (rv.kc.wKCAPL * kc_activity)(0, 0);
+
+            kc_apl_drive_ts(
+                static_cast<Eigen::Index>(t - t0)
+            ) = kc_apl_drive;
+
+            const double dIsdt =
+                -Is(t - 1) + kc_apl_drive * 1e4;
+            double dinhdt =
+                -inh(t - 1) + Is(t - 1);
+
+            pn_drive = rv.kc.wPNKC * pn_t.col(t);
+            kc_apl_inh = rv.kc.wAPLKC * inh(t - 1);
+
+            dKCdt =
+                (-Vm.col(t - 1)
+                 + pn_drive
+                 - kc_apl_inh).array()
+                - use_ffapl * ffapl_t(t - 1);
+
+            // Scalar inh / Is dynamics (same as original)
+            inh(t) = inh(t - 1) +
+                     dinhdt * p.time.dt / p.kc.apl_taum;
+            Is(t)  = Is(t - 1) +
+                     dIsdt  * p.time.dt / p.kc.tau_apl2kc;
+
+            // (optional logs preserved as comments)
+            // rv.log(cat("kc_apl_drive mean: ", kc_apl_drive_ts.mean()));
+            // rv.log(cat("After sim_KC_layer: ",
+            //            "wAPLKC mean: ", rv.kc.wAPLKC.mean(), ", ",
+            //            "Vm mean: ", Vm.mean(), ", ",
+            //            "Spikes mean: ", spikes.mean()));
+        }
+
+        // ----------------------------------------------------------------
+        // Shared KC membrane integration + vesicles + thresholding
+        // (all branches above only compute dKCdt; Vm update is common)
+        // ----------------------------------------------------------------
+        Vm.col(t) = Vm.col(t - 1) +
+                    dKCdt * (p.time.dt / p.kc.taum);
+
+        // Vesicle dynamics (same everywhere)
+        nves.col(t) = nves.col(t - 1);
+        nves.col(t) +=
+            p.time.dt *
+                ((1.0 - nves.col(t - 1).array()).matrix() / p.kc.tau_r) -
+            (p.kc.ves_p * spikes.col(t - 1).array() *
+             nves.col(t - 1).array())
+                .matrix();
+
+        // Thresholding + reset (shared)
+        auto const thr_comp =
+            Vm.col(t).array() > rv.kc.thr.array();
+        spikes.col(t) = thr_comp.select(1.0, spikes.col(t));
+        Vm.col(t)     = thr_comp.select(0.0, Vm.col(t));
+    }
 }
+
+// void sim_KC_layer(
+//     ModelParams const& p, RunVars const& rv,
+//     Matrix const& pn_t, Vector const& ffapl_t,
+//     Matrix& Vm, Matrix& spikes, Matrix& nves, Matrix& inh, Matrix& Is,
+//     Matrix& claw_sims) {
+//     /* Args:
+//      * - inh: APL potential timeseries
+//      * - Is: KC->APL synapse current (across all KCs) timeseries
+//      * */
+
+//     // Determine number of compartments
+//     // int n_compartments = rv.kc.claw_compartments.maxCoeff() + 1;
+//     Vm.setZero();
+//     spikes.setZero();
+//     // TODO why setOnes here?
+//     nves.setOnes();
+//     inh.setZero();
+//     Is.setZero();
+
+//     float use_ffapl = float(!p.kc.ignore_ffapl);
+//     if (p.kc.wPNKC_one_row_per_claw) {
+//         const Eigen::Index n_claws = rv.kc.claw_to_kc.size();
+//         // TODO log n_claws
+
+//         // TODO try to move outside of sim_KC_layer (at least the resize()?)?
+//         // (still need? delete?)
+//         // TODO this able to correct for initial size not being specified
+//         // correctly? (yes, seems so. may be slower doing it in here tho)
+//         claw_sims.resize(n_claws, p.time.steps_all());
+
+//         claw_sims.setZero();
+
+//         if (p.kc.apl_coup_const != -1) {
+//             // --- setup (unchanged pieces omitted) ---
+//             // --- Setup ---
+//             const auto& claws_by_compartment = rv.kc.compartment_to_claws;
+//             const int num_comp = int(claws_by_compartment.size());
+//             double g_voltage_coup = p.kc.apl_coup_const;
+
+//             // --- State Variables ---
+//             Eigen::VectorXd Is_prev_per_comp   = Eigen::VectorXd::Zero(num_comp);
+//             Eigen::VectorXd Is_curr_per_comp   = Is_prev_per_comp;
+            
+//             // APL has its own membrane potential, which replaces 'inh' for feedback
+//             Eigen::VectorXd Vm_apl_prev_per_comp = Eigen::VectorXd::Zero(num_comp);
+//             Eigen::VectorXd Vm_apl_curr_per_comp = Vm_apl_prev_per_comp;
+
+//             // 'inh' is preserved for other uses but not for feedback in this loop
+//             Eigen::VectorXd inh_prev_per_comp  = Eigen::VectorXd::Zero(num_comp);
+//             Eigen::VectorXd inh_curr_per_comp  = inh_prev_per_comp;
+
+//             // Scalars evolve in lock-step as sums of vectors
+//             double inh_prev = inh_prev_per_comp.sum();
+//             double Is_prev  = Is_prev_per_comp.sum();
+//             double inh_curr = inh_prev;
+//             double Is_curr  = Is_prev;
+
+//             // TODO TODO TODO shouldn't rest of values be filled in? am i missing
+//             // something?
+//             inh(0,0) = inh_prev;   // log scalar aggregates (global)
+//             Is(0,0)  = Is_prev;
+
+//             // (rest of setup is the same)
+//             Column dKCdt;
+//             Eigen::VectorXd comp_drive(num_comp);
+//             Eigen::VectorXd pn_drive(p.kc.N);
+//             Eigen::VectorXd kc_apl_inh(p.kc.N);
+
+//             // TODO better names for these (/ remove need for them -> delete)
+//             // (why are they sometimes not a rowvec/colvec, b/c they are matrices then?)
+//             const bool wkcapl_rowvec = (rv.kc.wKCAPL.rows() == 1);
+//             const bool waplkc_colvec = (rv.kc.wAPLKC.cols() == 1);
+
+//             for (unsigned t = p.time.start_step() + 1; t < p.time.steps_all(); ++t) {
+//                 // (1) KC -> APL drive per compartment (Unchanged)
+//                 const Eigen::VectorXd kc_activity =
+//                     (nves.col(t-1).array() * spikes.col(t-1).array()).matrix();
+
+//                 Eigen::VectorXd claw_drive(rv.kc.wPNKC.rows());
+//                 claw_drive.noalias() = rv.kc.wPNKC * pn_t.col(t);
+
+//                 comp_drive.setZero();
+
+//                 if(!p.kc.pn_claw_to_APL){
+//                     for (int comp = 0; comp < num_comp; ++comp) {
+//                         double s = 0.0;
+//                         for (int claw : claws_by_compartment[(size_t)comp]) {
+//                             const unsigned kc = rv.kc.claw_to_kc[(Eigen::Index)claw];
+//                             const double w_kc_apl = wkcapl_rowvec ? rv.kc.wKCAPL(0, claw) : rv.kc.wKCAPL(claw, 0);
+//                             s += w_kc_apl * kc_activity[kc];
+//                         }
+//                         comp_drive[comp] = 1e4 * s;
+//                     }
+//                 } else {
+//                     for (int comp = 0; comp < num_comp; ++comp) {
+//                         double s = 0.0;
+//                         for (int claw : claws_by_compartment[(size_t)comp]) {
+//                             const double w_kc_apl = wkcapl_rowvec ? rv.kc.wKCAPL(0, claw) : rv.kc.wKCAPL(claw, 0);
+//                             s += w_kc_apl * claw_drive[claw];
+//                         }
+//                         comp_drive[comp] = 0.2 * s;
+//                     }
+//                 }
+//                 // (2) APL Internal Dynamics (REVISED)
+//                 // (2a) The synaptic current 'Is' is updated as before.
+//                 Eigen::VectorXd dIs_comp_dt = -Is_prev_per_comp + comp_drive; 
+
+//                 // (2b) Calculate APL voltage change using the simplified capacitive model.
+//                 Eigen::VectorXd dVm_apl_dt = Eigen::VectorXd::Zero(num_comp);
+//                 const double inv_Cm = 1.0 / p.kc.apl_Cm;       // The single new parameter
+//                 const double inv_taum = 1.0 / p.kc.apl_taum; // Existing parameter
+
+//                 for (int c = 0; c < num_comp; ++c) {
+//                     // Synaptic current from KCs
+//                     const double I_syn = Is_prev_per_comp[c];
+
+//                     // Electrical coupling current from neighbors
+//                     const int L = (c - 1 + num_comp) % num_comp;
+//                     const int R = (c + 1) % num_comp;
+//                     const double I_coupling = g_voltage_coup * (Vm_apl_prev_per_comp[L] + Vm_apl_prev_per_comp[R]
+//                                                             - 2.0 * Vm_apl_prev_per_comp[c]);
+                    
+//                     // Sum the currents
+//                     const double I_total = I_syn + I_coupling;
+
+//                     // The change in voltage is the leak plus the integrated total current.
+//                     // dV/dt = -V/tau + I_total/Cm
+//                     dVm_apl_dt[c] = -inv_taum * Vm_apl_prev_per_comp[c] + inv_Cm * I_total;
+//                 }
+
+//                 // (2c) 'inh' variable is updated as before for other uses.
+//                 Eigen::VectorXd dInh_comp_dt = -inh_prev_per_comp + Is_prev_per_comp;
+
+//                 double dIsdt  = dIs_comp_dt.sum();
+//                 double dinhdt = dInh_comp_dt.sum();
+
+//                 // (3) APL -> KC Feedback (MODIFIED)
+//                 pn_drive.setZero();
+//                 kc_apl_inh.setZero();
+
+//                 // use the *vector* per-compartment inhibition (previous step)
+//                 for (int comp = 0; comp < num_comp; ++comp) {
+//                     // Feedback effect is now the APL's rectified voltage directly (gain = 1.0).
+//                     const double total_apl_effect = std::max(0.0, Vm_apl_prev_per_comp[comp]);
+
+//                     for (int claw : claws_by_compartment[(size_t)comp]) {
+//                         const unsigned kc = rv.kc.claw_to_kc[(Eigen::Index)claw];
+//                         pn_drive[kc] += claw_drive[claw];
+//                         const double w_apl_kc = waplkc_colvec ? rv.kc.wAPLKC(claw, 0) : rv.kc.wAPLKC(0, claw);
+//                         kc_apl_inh[kc] += w_apl_kc * total_apl_effect;
+//                     }
+//                 }
+
+//                 dKCdt = (-Vm.col(t-1) + pn_drive - kc_apl_inh).array()
+//                         - float(!p.kc.ignore_ffapl) * ffapl_t(t-1);
+//                 Vm.col(t) = Vm.col(t-1) + dKCdt * (p.time.dt / p.kc.taum);
+
+//                 // (5) Advance APL state variables (Unchanged from previous version)
+//                 Is_curr_per_comp   = Is_prev_per_comp   + (p.time.dt / p.kc.tau_apl2kc) * dIs_comp_dt;
+//                 inh_curr_per_comp  = inh_prev_per_comp  + (p.time.dt / p.kc.apl_taum)   * dInh_comp_dt;
+//                 Vm_apl_curr_per_comp = Vm_apl_prev_per_comp + p.time.dt * dVm_apl_dt;
+                
+//                 Is_curr  = Is_prev  + (p.time.dt / p.kc.tau_apl2kc) * dIsdt;
+//                 inh_curr = inh_prev + (p.time.dt / p.kc.apl_taum)   * dinhdt;
+
+//                 // Is_curr  = Is_curr_per_comp.sum();
+//                 // inh_curr = inh_curr_per_comp.sum();
+//                 Is(0,t)  = Is_curr;
+//                 inh(0,t) = inh_curr;
+
+//                 // (6) Vesicles + thresholding (unchanged)
+//                 nves.col(t) = nves.col(t-1);
+//                 nves.col(t) += p.time.dt * ((1.0 - nves.col(t-1).array()).matrix()/p.kc.tau_r)
+//                             - (p.kc.ves_p * spikes.col(t-1).array() * nves.col(t-1).array()).matrix();
+
+//                 auto const over_thr = Vm.col(t).array() > rv.kc.thr.array();
+//                 spikes.col(t) = over_thr.select(1.0, spikes.col(t));
+//                 Vm.col(t)     = over_thr.select(0.0, Vm.col(t));
+
+//                 // TODO what is this doing?
+//                 std::swap(Is_prev_per_comp,  Is_curr_per_comp);
+//                 std::swap(Vm_apl_prev_per_comp, Vm_apl_curr_per_comp);
+//                 std::swap(inh_prev_per_comp, inh_curr_per_comp);
+//                 Is_prev  = Is_curr;
+//                 inh_prev = inh_curr;
+//             }
+//         } else {
+//             Column dKCdt;
+//             double total_kc_apl_drive = 0.0; 
+//             double total_claw_apl_drive = 0.0; 
+//             // double total_claw_drive = 0.0;
+//             // double total_pn_drive = 0.0;
+//             // double total_kc_apl_inh = 0.0;
+//             //const Eigen::Index n_claws = rv.kc.claw_to_kc.size();
+//             for (unsigned t = p.time.start_step()+1; t < p.time.steps_all(); t++) { 
+//                 // Calculate the KC-level activity, a vector of size (p.kc.N, 1)
+//                 Eigen::VectorXd kc_activity = (
+//                     nves.col(t-1).array() * spikes.col(t-1).array()
+//                 ).matrix();
+
+//                 // Sum the weighted activity of all KCs to get a single APL input value.
+//                 // This resolves the dimension mismatch.
+//                 Eigen::VectorXd claw_drive = rv.kc.wPNKC * pn_t.col(t);       // size = nClaws
+//                 double claw_apl_drive = rv.kc.wKCAPL.col(0).dot(claw_drive);
+//                 claw_apl_drive = claw_apl_drive * 0.2;
+
+//                 double kc_apl_drive = 0.0;
+//                 for (Eigen::Index claw=0; claw<n_claws; ++claw) {
+//                     unsigned kc = rv.kc.claw_to_kc[claw];
+//                     // TODO TODO TODO do we want to require the KCs to spike tho? if
+//                     // not, how to get math to work out somewhat similar to before, when
+//                     // this was fully dependent on KCs spiking (tuning may mostly take
+//                     // care of that?)
+//                     // TODO TODO TODO add flag to control whether this depends on
+//                     // spiking or not (should directly depend on claw activities if not)
+//                     kc_apl_drive += rv.kc.wKCAPL(claw) * kc_activity[kc];
+//                 }
+
+//                 // rv.kc.wPNKC: a matrix of size (nClaws x nGloms)
+//                 // pn_t.col(t): a vector of size (nGloms) giving the PN activity at time
+//                 // step t.
+//                 Eigen::VectorXd claw_drive_with_inh = (
+//                     // all of these have 1 col and #-claws rows (e.g. 9472),
+//                     // as does claw_sims.col(t)
+//                     claw_drive - rv.kc.wAPLKC * inh(t-1)
+//                 );
+
+//                 // TODO TODO TODO also set claw_sims in `apl_coup_const != -1` case
+//                 // above (+ change math in same manner changed below), and also use
+//                 // allow_net_inh_per_claw (alongside slight change to calculation, to
+//                 // operate within each claw first) in that case
+//                 //
+//                 // TODO rename to something w/ units? what are proper units (and do they
+//                 // make sense as-is? does it really matter?)?
+//                 claw_sims.col(t) = claw_drive_with_inh;
+
+//                 if (!p.kc.allow_net_inh_per_claw) {
+//                     // there typically will be claws that would get sent negative b/c of
+//                     // inhibition, so we do need to clip if we want to avoid single
+//                     // claws contribution inhibition exceeding their excitation
+//                     auto const claw_drives_lt0 = claw_sims.col(t).array() < 0;
+//                     // replace per-claw drives to min of 0
+//                     claw_sims.col(t) = claw_drives_lt0.select(0.0, claw_sims.col(t));
+//                     check(claw_sims.col(t).minCoeff() >= 0);
+//                 }
+
+//                 total_kc_apl_drive += kc_apl_drive * 1e4;
+//                 total_claw_apl_drive += claw_apl_drive;
+
+//                 double dIsdt; 
+//                 if(!p.kc.pn_claw_to_APL){
+//                     dIsdt = -Is(t-1) + kc_apl_drive * 1e4;
+//                 } else {
+//                     dIsdt = -Is(t-1) + claw_apl_drive;
+//                 }
+
+//                 double dinhdt = -inh(t-1) + Is(t-1);
+
+//                 Eigen::VectorXd pn_drive = Eigen::VectorXd::Zero(p.kc.N);
+//                 for (Eigen::Index claw=0; claw<n_claws; ++claw) {
+//                     unsigned kc = rv.kc.claw_to_kc[claw];
+//                     pn_drive[kc] += claw_sims(claw, t);
+//                 }
+
+//                 Eigen::VectorXd kc_apl_inh = Eigen::VectorXd::Zero(p.kc.N); // size = nKCs  
+//                 for (Eigen::Index claw = 0; claw < n_claws; ++claw) {
+//                     unsigned kc = rv.kc.claw_to_kc[claw];
+//                     // The APL inhibition is weighted by the APL->KC weight
+//                     // and applied to the corresponding KC.
+//                     kc_apl_inh[kc] += rv.kc.wAPLKC(claw, 0) * inh(t - 1);
+//                 }
+
+//                 // dKCdt =
+//                 //     (-Vm.col(t-1)
+//                 //     + pn_drive
+//                 //     - kc_apl_inh).array() // Now this term has the correct size
+//                 //     - use_ffapl * ffapl_t(t-1);
+     
+//                 dKCdt = (-Vm.col(t-1) + pn_drive).array() - use_ffapl * ffapl_t(t-1);
+
+//                 // total_claw_drive += claw_drive.mean();
+//                 // total_pn_drive += pn_drive.mean();
+//                 // total_kc_apl_inh += kc_apl_inh.mean();
+//                 // --- Now use the correctly sized KC-level inhibition ---
+//                 // dKCdt =
+//                 //     (-Vm.col(t-1)
+//                 //     + pn_drive
+//                 //     - kc_apl_inh).array() // Now this term has the correct size
+//                 //     - use_ffapl * ffapl_t(t-1);
+     
+//                 Vm.col(t) = Vm.col(t-1) + dKCdt*p.time.dt/p.kc.taum;
+//                 inh(t)    = inh(t-1)    + dinhdt*p.time.dt/p.kc.apl_taum;
+//                 Is(t)     = Is(t-1)     + dIsdt*p.time.dt/p.kc.tau_apl2kc;
+
+//                 nves.col(t) = nves.col(t-1);
+//                 nves.col(t) += (p.time.dt *
+//                     ((1.0 - nves.col(t-1).array()).matrix() / p.kc.tau_r) -
+//                     (p.kc.ves_p*spikes.col(t-1).array() *
+//                      nves.col(t-1).array()).matrix()
+//                 );
+
+//                 auto const thr_comp = Vm.col(t).array() > rv.kc.thr.array();
+//                 // either go to 1 or _stay_ at 0.
+//                 spikes.col(t) = thr_comp.select(1.0, spikes.col(t));
+//                 // very abrupt repolarization!
+//                 Vm.col(t) = thr_comp.select(0.0, Vm.col(t));
+//             }
+//             // rv.log(cat("mean claw_apl_drive ", total_claw_apl_drive / p.time.steps_all()));
+//             // rv.log(cat("mean kc_apl_drive ", total_kc_apl_drive / p.time.steps_all()));
+//             // rv.log(cat("mean kc_apl_inh ", total_kc_apl_inh/ p.time.steps_all()));
+//         }
+//     } else {
+//         Column dKCdt;
+//         Eigen::VectorXd kc_apl_drive_ts;
+//         const unsigned t0 = p.time.start_step() + 1;
+//         const unsigned tN = p.time.steps_all();
+//         // TODO describe what this is doing
+//         const Eigen::Index T = static_cast<Eigen::Index>(tN - t0);
+//         kc_apl_drive_ts.resize(T);
+//         kc_apl_drive_ts.setZero();
+//         // vector to store kc_apl_drive in each iteration
+//         for (unsigned t = p.time.start_step()+1; t < p.time.steps_all(); t++) {
+//             Eigen::VectorXd kc_activity =
+//                 (nves.col(t-1).array() * spikes.col(t-1).array()).matrix();
+
+//             // 1xN * Nx1 -> 1x1, then extract the (0,0) scalar
+//             // TODO add assertion shape is actually (1,1) like we expect, before
+//             // subsetting?
+//             const double kc_apl_drive = (rv.kc.wKCAPL * kc_activity)(0,0);
+//             kc_apl_drive_ts(static_cast<Eigen::Index>(t - t0)) = kc_apl_drive;
+//             // use the scalar
+//             // TODO what is the 1e4 for?
+//             const double dIsdt = -Is(t-1) + kc_apl_drive * 1e4;
+//             double dinhdt = -inh(t-1) + Is(t-1);
+//             dKCdt =
+//                 (-Vm.col(t-1)
+//                 +rv.kc.wPNKC*pn_t.col(t)
+//                 -rv.kc.wAPLKC*inh(t-1)).array()
+//                 -use_ffapl*ffapl_t(t-1);
+
+//             Vm.col(t) = Vm.col(t-1) + dKCdt*p.time.dt/p.kc.taum;
+//             inh(t)    = inh(t-1)    + dinhdt*p.time.dt/p.kc.apl_taum;
+//             Is(t)     = Is(t-1)     + dIsdt*p.time.dt/p.kc.tau_apl2kc;
+
+//             nves.col(t) = nves.col(t-1);
+//             nves.col(t) += p.time.dt*((1.0-nves.col(t-1).array()).matrix()/p.kc.tau_r) - (p.kc.ves_p*spikes.col(t-1).array()*nves.col(t-1).array()).matrix();
+
+//             auto const thr_comp = Vm.col(t).array() > rv.kc.thr.array();
+//             // either go to 1 or _stay_ at 0.
+//             spikes.col(t) = thr_comp.select(1.0, spikes.col(t));
+//             // TODO add assertion that checks spikes max is 1? or that unique values are
+//             // 0/1?
+
+//             // TODO describe how exactly this is working
+//             // very abrupt repolarization!
+//             Vm.col(t) = thr_comp.select(0.0, Vm.col(t));
+//         }
+//         // rv.log(cat("kc_apl_drive mean: ", kc_apl_drive_ts.mean()));
+//         // rv.log(cat("After sim_KC_layer: ", "wAPLKC mean: ", rv.kc.wAPLKC.mean(), ", ", "Vm mean: ", Vm.mean(), ", ", "Spikes mean: ", spikes.mean()));
+//     }
+//     // TODO TODO assert nves is all 1, if ves_p == 0 (which it should be)?
+
+//     // TODO TODO TODO even if it seems true that inh/Is are all 0 on the first calls,
+//     // when picking threshold: *why* are they 0 there, when it doesnt seem like i was
+//     // always properly setting wAPLKC/wKCAPL to 0 for those calls [in case where
+//     // preset_*=true, i.e. use_connectome_APL_weights=True in python fit_mb_model]?
+//     // (is there something else that changed across the two calls in fit_sparseness?)
+//     // TODO delete
+//     /*
+//     rv.log(cat(
+//         "rv.kc.wAPLKC.isZero(): ", rv.kc.wAPLKC.isZero(),
+//         " (rv.kc.wAPLKC.array() == 0).all(): ", (rv.kc.wAPLKC.array() == 0.0).all(),
+//         "\nrv.kc.wKCAPL.isZero(): ", rv.kc.wKCAPL.isZero(),
+//         " (rv.kc.wKCAPL.array() == 0).all(): ", (rv.kc.wKCAPL.array() == 0.0).all(),
+//         "\ninh.isZero(): ", inh.isZero(),
+//         " (inh.array() == 0.0).all(): ", (inh.array() == 0.0).all(),
+//         "\nIs.isZero(): ", Is.isZero(),
+//         " (Is.array() == 0.0).all(): ", (Is.array() == 0.0).all()
+//     ));
+//     */
+//     //
+// }
 
 void run_ORN_LN_sims(ModelParams const& p, RunVars& rv) {
     std::vector<unsigned> simlist = get_simlist(p);
